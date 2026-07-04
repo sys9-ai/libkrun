@@ -14,7 +14,7 @@ use libc::{c_int, c_void, read, readv, size_t, write, writev};
 
 use super::bindings::{off64_t, pread64, preadv64, pwrite64, pwritev64};
 #[cfg(feature = "blk")]
-use super::block::device::DiskProperties;
+use super::block::device::{DiskBackend, DiskProperties};
 
 /// A trait for setting the size of a file.
 /// This is equivalent to File's `set_len` method, but
@@ -417,6 +417,15 @@ macro_rules! volatile_impl {
 volatile_impl!(File);
 
 #[cfg(feature = "blk")]
+fn volatile_slices_len(bufs: &[VolatileSlice]) -> Result<usize> {
+    bufs.iter().try_fold(0usize, |total, slice| {
+        total
+            .checked_add(slice.len())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "volatile slice length overflow"))
+    })
+}
+
+#[cfg(feature = "blk")]
 impl FileReadWriteAtVolatile for DiskProperties {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
         self.read_vectored_at_volatile(&[slice], offset)
@@ -427,13 +436,15 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
-        let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
-        let full_length = iovec
-            .len()
-            .try_into()
-            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().readv(iovec, offset)?;
-        Ok(full_length)
+        match &self.backend {
+            DiskBackend::Raw(file) => file.read_vectored_at_volatile(bufs, offset),
+            DiskBackend::Formatted(image) => {
+                let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
+                let full_length = volatile_slices_len(bufs)?;
+                image.lock().unwrap().readv(iovec, offset)?;
+                Ok(full_length)
+            }
+        }
     }
 
     fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -445,12 +456,14 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
-        let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
-        let full_length = iovec
-            .len()
-            .try_into()
-            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().writev(iovec, offset)?;
-        Ok(full_length)
+        match &self.backend {
+            DiskBackend::Raw(file) => file.write_vectored_at_volatile(bufs, offset),
+            DiskBackend::Formatted(image) => {
+                let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
+                let full_length = volatile_slices_len(bufs)?;
+                image.lock().unwrap().writev(iovec, offset)?;
+                Ok(full_length)
+            }
+        }
     }
 }

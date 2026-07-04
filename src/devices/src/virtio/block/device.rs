@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
+    file::File as ImagoFile, qcow2::Qcow2, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
     PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
 };
 use log::{error, warn};
@@ -39,6 +39,65 @@ use crate::virtio::{
     block::{ImageType, SyncMode},
     ActivateError, InterruptTransport,
 };
+
+#[derive(Clone)]
+pub(crate) enum DiskBackend {
+    Raw(Arc<File>),
+    Formatted(Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>),
+}
+
+impl DiskBackend {
+    fn size(&self) -> u64 {
+        match self {
+            DiskBackend::Raw(file) => file.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            DiskBackend::Formatted(image) => image.lock().unwrap().size(),
+        }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        match self {
+            DiskBackend::Raw(_) => Ok(()),
+            DiskBackend::Formatted(image) => image.lock().unwrap().flush(),
+        }
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        match self {
+            DiskBackend::Raw(file) => file.sync_all(),
+            DiskBackend::Formatted(image) => image.lock().unwrap().sync(),
+        }
+    }
+
+    fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
+        match self {
+            DiskBackend::Raw(_) => {
+                let _ = (offset, length);
+                Ok(())
+            }
+            DiskBackend::Formatted(image) => image.lock().unwrap().discard_to_any(offset, length),
+        }
+    }
+
+    fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
+        match self {
+            DiskBackend::Raw(_) => {
+                let _ = (offset, length);
+                Err(io::ErrorKind::Unsupported.into())
+            }
+            DiskBackend::Formatted(image) => image.lock().unwrap().discard_to_zero(offset, length),
+        }
+    }
+
+    fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        match self {
+            DiskBackend::Raw(_) => {
+                let _ = (offset, length);
+                Err(io::ErrorKind::Unsupported.into())
+            }
+            DiskBackend::Formatted(image) => image.lock().unwrap().write_zeroes(offset, length),
+        }
+    }
+}
 
 /// Configuration options for disk caching.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -68,18 +127,18 @@ impl CacheType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) backend: DiskBackend,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        backend: DiskBackend,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
     ) -> io::Result<Self> {
-        let disk_size = disk_image.lock().unwrap().size();
+        let disk_size = backend.size();
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -94,7 +153,7 @@ impl DiskProperties {
             cache_type,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
-            file: disk_image,
+            backend,
         })
     }
 
@@ -138,6 +197,26 @@ impl DiskProperties {
     pub fn cache_type(&self) -> CacheType {
         self.cache_type
     }
+
+    pub(crate) fn flush(&self) -> io::Result<()> {
+        self.backend.flush()
+    }
+
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.backend.sync()
+    }
+
+    pub(crate) fn discard_to_any(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.backend.discard_to_any(offset, length)
+    }
+
+    pub(crate) fn discard_to_zero(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.backend.discard_to_zero(offset, length)
+    }
+
+    pub(crate) fn write_zeroes(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.backend.write_zeroes(offset, length)
+    }
 }
 
 impl Drop for DiskProperties {
@@ -145,11 +224,11 @@ impl Drop for DiskProperties {
         match self.cache_type {
             CacheType::Writeback => {
                 // flush() first to force any cached data out.
-                if self.file.lock().unwrap().flush().is_err() {
+                if self.backend.flush().is_err() {
                     error!("Failed to flush block data on drop.");
                 }
                 // Sync data out to physical media on host.
-                if self.file.lock().unwrap().sync().is_err() {
+                if self.backend.sync().is_err() {
                     error!("Failed to sync block data on drop.")
                 }
             }
@@ -205,7 +284,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: DiskBackend,
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -245,52 +324,63 @@ impl Block {
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
 
-        let file_opts = StorageOpenOptions::new()
-            .write(!is_disk_read_only)
-            .filename(disk_image_path)
-            .direct(direct_io);
-
-        #[cfg(target_os = "macos")]
-        let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
-        let discard_alignment = file.discard_align();
-
-        let disk_image = match disk_image_format {
+        let raw_disk = disk_image_format == ImageType::Raw;
+        let (disk_image, discard_alignment) = match disk_image_format {
+            ImageType::Raw => (DiskBackend::Raw(Arc::new(disk_image)), 512),
             ImageType::Qcow2 => {
+                let file_opts = StorageOpenOptions::new()
+                    .write(!is_disk_read_only)
+                    .filename(disk_image_path)
+                    .direct(direct_io);
+
+                #[cfg(target_os = "macos")]
+                let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+
+                let file = ImagoFile::open_sync(file_opts)?;
+                let discard_alignment = file.discard_align();
                 let mut qcow2 =
                     Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
                 qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
-            }
-            ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
+                (
+                    DiskBackend::Formatted(Arc::new(Mutex::new(SyncFormatAccess::new(qcow2)?))),
+                    discard_alignment,
+                )
             }
             ImageType::Vmdk => {
+                let file_opts = StorageOpenOptions::new()
+                    .write(!is_disk_read_only)
+                    .filename(disk_image_path)
+                    .direct(direct_io);
+
+                #[cfg(target_os = "macos")]
+                let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+
+                let file = ImagoFile::open_sync(file_opts)?;
+                let discard_alignment = file.discard_align();
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
                 .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+                (
+                    DiskBackend::Formatted(Arc::new(Mutex::new(SyncFormatAccess::new(vmdk)?))),
+                    discard_alignment,
+                )
             }
         };
-
-        let disk_image = Arc::new(Mutex::new(disk_image));
 
         let disk_properties =
             DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
-            | (1u64 << VIRTIO_BLK_F_DISCARD)
-            | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
             | (1u64 << VIRTIO_RING_F_EVENT_IDX);
+
+        if !raw_disk {
+            avail_features |= (1u64 << VIRTIO_BLK_F_DISCARD) | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES);
+        }
 
         if sync_mode != SyncMode::None {
             avail_features |= 1u64 << VIRTIO_BLK_F_FLUSH;
@@ -411,7 +501,7 @@ impl VirtioDevice for Block {
         let disk = match self.disk.take() {
             Some(d) => d,
             None => DiskProperties::new(
-                Arc::clone(&self.disk_image),
+                self.disk_image.clone(),
                 self.disk_image_id.clone(),
                 self.cache_type,
             )
