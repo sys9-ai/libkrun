@@ -2,6 +2,49 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn target_env_key(prefix: &str, target: &str) -> String {
+    format!(
+        "{}_{}",
+        prefix,
+        target
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .collect::<String>()
+    )
+}
+
+fn default_target_cc(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-unknown-linux-gnu" => Some("x86_64-linux-gnu-gcc"),
+        "aarch64-unknown-linux-gnu" => Some("aarch64-linux-gnu-gcc"),
+        _ => None,
+    }
+}
+
+fn linux_init_cc() -> String {
+    if let Ok(cc) = std::env::var("CC_LINUX") {
+        return cc;
+    }
+
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let host = std::env::var("HOST").unwrap_or_default();
+    if !target.is_empty() && target != host {
+        for key in [
+            target_env_key("CC", &target),
+            target_env_key("CARGO_TARGET", &target) + "_LINKER",
+        ] {
+            if let Ok(cc) = std::env::var(&key) {
+                return cc;
+            }
+        }
+        if let Some(cc) = default_target_cc(&target) {
+            return cc.to_string();
+        }
+    }
+
+    std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
+}
+
 fn build_default_init() -> PathBuf {
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let libkrun_root = manifest_dir.join("../..");
@@ -13,6 +56,12 @@ fn build_default_init() -> PathBuf {
 
     println!("cargo:rerun-if-env-changed=CC_LINUX");
     println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=TARGET");
+    println!("cargo:rerun-if-env-changed=HOST");
+    println!("cargo:rerun-if-env-changed=CC_X86_64_UNKNOWN_LINUX_GNU");
+    println!("cargo:rerun-if-env-changed=CC_AARCH64_UNKNOWN_LINUX_GNU");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER");
+    println!("cargo:rerun-if-env-changed=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER");
     println!("cargo:rerun-if-env-changed=TIMESYNC");
     println!("cargo:rerun-if-changed={}", init_src.display());
     println!("cargo:rerun-if-changed={}", dhcp_src.display());
@@ -30,9 +79,7 @@ fn build_default_init() -> PathBuf {
         init_cc_flags.push("-D__TIMESYNC__");
     }
 
-    let cc_value = std::env::var("CC_LINUX")
-        .or_else(|_| std::env::var("CC"))
-        .unwrap_or_else(|_| "cc".to_string());
+    let cc_value = linux_init_cc();
     let mut cc_parts = cc_value.split_ascii_whitespace();
     let cc = cc_parts.next().expect("CC_LINUX/CC must not be empty");
     let status = Command::new(cc)
