@@ -33,6 +33,7 @@ const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+const GUEST_XATTR_PREFIX: &[u8] = b"user.containers.guest_xattr.";
 const UID_MAX: u32 = u32::MAX - 1;
 
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
@@ -145,6 +146,10 @@ impl ScopedCaps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn stat_with_owner(uid: libc::uid_t, gid: libc::gid_t, mode: libc::mode_t) -> libc::stat64 {
         let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
@@ -184,6 +189,60 @@ mod tests {
         assert_eq!(uid, Some(0));
         assert_eq!(gid, Some(0));
         assert_eq!(mode, Some(0o755));
+    }
+
+    #[test]
+    fn guest_xattr_name_is_mapped_to_user_namespace() {
+        let name = CStr::from_bytes_with_nul(b"security.capability\0").unwrap();
+        let got = host_xattr_name_for_guest(name).unwrap();
+
+        assert_eq!(
+            got.to_bytes(),
+            b"user.containers.guest_xattr.73656375726974792e6361706162696c697479"
+        );
+    }
+
+    #[test]
+    fn guest_xattr_list_decodes_only_mapped_names() {
+        let raw = b"user.containers.override_stat\0user.containers.guest_xattr.73656375726974792e6361706162696c697479\0user.host-only\0";
+
+        let got = guest_xattr_list_from_host(raw);
+
+        assert_eq!(got, b"security.capability\0");
+    }
+
+    fn unique_tmp_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "krun-devices-{name}-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn override_xattr_ignores_symlink_owner() {
+        let dir = unique_tmp_dir("symlink-owner");
+        let link_path = dir.join("link");
+        std::os::unix::fs::symlink("/missing-target", &link_path).unwrap();
+
+        let c_path = CString::new(link_path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(fd >= 0, "open symlink: {}", io::Error::last_os_error());
+        let file = unsafe { File::from_raw_fd(fd) };
+
+        set_override_xattr(file.as_raw_fd(), Some((33, 44)), None).unwrap();
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -229,6 +288,10 @@ fn get_xattr_common(buf: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>) {
 }
 
 fn get_override_xattr(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    if host_fd_is_symlink(fd)? {
+        return Ok((None, None, None));
+    }
+
     let mut buf = vec![0; 32];
     let res = unsafe {
         libc::fgetxattr(
@@ -268,6 +331,10 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
 }
 
 fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
+    if host_fd_is_symlink(fd)? {
+        return Ok(());
+    }
+
     let buf = if is_valid_owner(owner) && mode.is_some() {
         let owner = owner.unwrap();
         let mode = mode.unwrap();
@@ -334,6 +401,62 @@ fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -
     }
 }
 
+fn host_xattr_name_for_guest(name: &CStr) -> io::Result<CString> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let guest_name = name.to_bytes();
+    let mut host_name = Vec::with_capacity(GUEST_XATTR_PREFIX.len() + guest_name.len() * 2);
+    host_name.extend_from_slice(GUEST_XATTR_PREFIX);
+    for b in guest_name {
+        host_name.push(HEX[(b >> 4) as usize]);
+        host_name.push(HEX[(b & 0x0f) as usize]);
+    }
+
+    CString::new(host_name).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn guest_xattr_name_from_host(name: &[u8]) -> Option<Vec<u8>> {
+    fn hex_value(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let encoded = name.strip_prefix(GUEST_XATTR_PREFIX)?;
+    if encoded.is_empty() || encoded.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut guest_name = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.chunks_exact(2) {
+        let high = hex_value(pair[0])?;
+        let low = hex_value(pair[1])?;
+        guest_name.push((high << 4) | low);
+    }
+    if guest_name.is_empty() || guest_name.contains(&0) {
+        return None;
+    }
+
+    Some(guest_name)
+}
+
+fn guest_xattr_list_from_host(host_list: &[u8]) -> Vec<u8> {
+    let mut guest_list = Vec::new();
+    for host_name in host_list.split(|b| *b == 0) {
+        if host_name.is_empty() {
+            continue;
+        }
+        if let Some(guest_name) = guest_xattr_name_from_host(host_name) {
+            guest_list.extend_from_slice(&guest_name);
+            guest_list.push(0);
+        }
+    }
+    guest_list
+}
+
 fn apply_override_stat(
     mut st: libc::stat64,
     uid: Option<u32>,
@@ -388,6 +511,10 @@ fn host_stat_fd(fd: RawFd) -> io::Result<libc::stat64> {
 
 fn host_stat(f: &File) -> io::Result<libc::stat64> {
     host_stat_fd(f.as_raw_fd())
+}
+
+fn host_fd_is_symlink(fd: RawFd) -> io::Result<bool> {
+    Ok(host_stat_fd(fd)?.st_mode & libc::S_IFMT == libc::S_IFLNK)
 }
 
 fn stat(
@@ -606,6 +733,35 @@ pub struct PassthroughFs {
 enum FileOrLink {
     File(File),
     Link(CString),
+}
+
+fn list_xattr_raw(
+    target: &FileOrLink,
+    buf: *mut libc::c_char,
+    size: libc::size_t,
+) -> libc::ssize_t {
+    match target {
+        FileOrLink::File(file) => unsafe { libc::flistxattr(file.as_raw_fd(), buf, size) },
+        FileOrLink::Link(link) => unsafe { libc::llistxattr(link.as_ptr(), buf, size) },
+    }
+}
+
+fn list_host_xattrs(target: &FileOrLink) -> io::Result<Vec<u8>> {
+    let res = list_xattr_raw(target, std::ptr::null_mut(), 0);
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if res == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut buf = vec![0; res as usize];
+    let res = list_xattr_raw(target, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.resize(res as usize, 0);
+    Ok(buf)
 }
 
 impl PassthroughFs {
@@ -2005,6 +2161,8 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
+        let host_name = host_xattr_name_for_guest(name)?;
+
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
         // functions in that case.
@@ -2014,7 +2172,7 @@ impl FileSystem for PassthroughFs {
                 unsafe {
                     libc::fsetxattr(
                         file.as_raw_fd(),
-                        name.as_ptr(),
+                        host_name.as_ptr(),
                         value.as_ptr() as *const libc::c_void,
                         value.len(),
                         flags as libc::c_int,
@@ -2026,7 +2184,7 @@ impl FileSystem for PassthroughFs {
                 unsafe {
                     libc::lsetxattr(
                         link.as_ptr(),
-                        name.as_ptr(),
+                        host_name.as_ptr(),
                         value.as_ptr() as *const libc::c_void,
                         value.len(),
                         flags as libc::c_int,
@@ -2057,6 +2215,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENODATA));
         }
 
+        let host_name = host_xattr_name_for_guest(name)?;
         let mut buf = vec![0; size as usize];
 
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
@@ -2068,7 +2227,7 @@ impl FileSystem for PassthroughFs {
                 unsafe {
                     libc::fgetxattr(
                         file.as_raw_fd(),
-                        name.as_ptr(),
+                        host_name.as_ptr(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         size as libc::size_t,
                     )
@@ -2079,7 +2238,7 @@ impl FileSystem for PassthroughFs {
                 unsafe {
                     libc::lgetxattr(
                         link.as_ptr(),
-                        name.as_ptr(),
+                        host_name.as_ptr(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         size as libc::size_t,
                     )
@@ -2104,38 +2263,17 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let mut buf = vec![0; size as usize];
-
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
         // functions in that case.
-        let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
-            FileOrLink::File(file) => {
-                // Safe because this will only modify the contents of `buf`.
-                unsafe {
-                    libc::flistxattr(
-                        file.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_char,
-                        size as libc::size_t,
-                    )
-                }
-            }
-            FileOrLink::Link(link) => unsafe {
-                libc::llistxattr(
-                    link.as_ptr(),
-                    buf.as_mut_ptr() as *mut libc::c_char,
-                    size as libc::size_t,
-                )
-            },
-        };
-        if res < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let target = self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let buf = guest_xattr_list_from_host(&list_host_xattrs(&target)?);
 
         if size == 0 {
-            Ok(ListxattrReply::Count(res as u32))
+            Ok(ListxattrReply::Count(buf.len() as u32))
+        } else if (size as usize) < buf.len() {
+            Err(io::Error::from_raw_os_error(libc::ERANGE))
         } else {
-            buf.resize(res as usize, 0);
             Ok(ListxattrReply::Names(buf))
         }
     }
@@ -2145,17 +2283,19 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
+        let host_name = host_xattr_name_for_guest(name)?;
+
         // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
         // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
         // functions in that case.
         let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
             FileOrLink::File(file) => {
                 // Safe because this doesn't modify any memory and we check the return value.
-                unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) }
+                unsafe { libc::fremovexattr(file.as_raw_fd(), host_name.as_ptr()) }
             }
             FileOrLink::Link(link) => {
                 // Safe because this doesn't modify any memory and we check the return value.
-                unsafe { libc::lremovexattr(link.as_ptr(), name.as_ptr()) }
+                unsafe { libc::lremovexattr(link.as_ptr(), host_name.as_ptr()) }
             }
         };
 
