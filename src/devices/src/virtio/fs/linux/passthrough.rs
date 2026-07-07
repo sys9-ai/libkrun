@@ -32,6 +32,8 @@ const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
+const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+const UID_MAX: u32 = u32::MAX - 1;
 
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 
@@ -140,6 +142,51 @@ impl ScopedCaps {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stat_with_owner(uid: libc::uid_t, gid: libc::gid_t, mode: libc::mode_t) -> libc::stat64 {
+        let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+        st.st_uid = uid;
+        st.st_gid = gid;
+        st.st_mode = libc::S_IFREG | mode;
+        st
+    }
+
+    #[test]
+    fn override_stat_maps_host_owner_to_guest_root_by_default() {
+        let st = stat_with_owner(1000, 1000, 0o644);
+
+        let got = apply_override_stat(st, None, None, None, Some(1000), Some(1000));
+
+        assert_eq!(got.st_uid, 0);
+        assert_eq!(got.st_gid, 0);
+        assert_eq!(got.st_mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn override_stat_uses_xattr_owner_and_octal_mode() {
+        let st = stat_with_owner(1000, 1000, 0o644);
+
+        let got = apply_override_stat(st, Some(33), Some(44), Some(0o755), Some(1000), Some(1000));
+
+        assert_eq!(got.st_uid, 33);
+        assert_eq!(got.st_gid, 44);
+        assert_eq!(got.st_mode & libc::S_IFMT, libc::S_IFREG);
+        assert_eq!(got.st_mode & 0o777, 0o755);
+    }
+
+    #[test]
+    fn override_xattr_parser_reads_mode_as_octal() {
+        let (uid, gid, mode) = get_xattr_common(b"0:0:0755");
+
+        assert_eq!(uid, Some(0));
+        assert_eq!(gid, Some(0));
+        assert_eq!(mode, Some(0o755));
+    }
+}
+
 impl Drop for ScopedCaps {
     fn drop(&mut self) {
         caps::raise(None, CapSet::Effective, self.cap)
@@ -159,7 +206,163 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
-fn stat(f: &File) -> io::Result<libc::stat64> {
+fn proc_fd_path(fd: RawFd) -> io::Result<CString> {
+    CString::new(format!("/proc/self/fd/{fd}"))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
+    match std::str::from_utf8(item) {
+        Ok(val) => u32::from_str_radix(val, radix).ok(),
+        Err(_) => None,
+    }
+}
+
+fn get_xattr_common(buf: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let mut items = buf.split(|c| *c == b':');
+
+    let uid = items.next().and_then(|item| item_to_value(item, 10));
+    let gid = items.next().and_then(|item| item_to_value(item, 10));
+    let mode = items.next().and_then(|item| item_to_value(item, 8));
+
+    (uid, gid, mode)
+}
+
+fn get_override_xattr(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let mut buf = vec![0; 32];
+    let res = unsafe {
+        libc::fgetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    let res = if res < 0 {
+        let path = proc_fd_path(fd)?;
+        unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                XATTR_KEY.as_ptr() as *const libc::c_char,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        }
+    } else {
+        res
+    };
+    if res < 0 {
+        return Ok((None, None, None));
+    }
+
+    buf.resize(res as usize, 0);
+    Ok(get_xattr_common(&buf))
+}
+
+fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
+    if let Some(owner) = owner {
+        owner.0 < UID_MAX && owner.1 < UID_MAX
+    } else {
+        false
+    }
+}
+
+fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
+    let buf = if is_valid_owner(owner) && mode.is_some() {
+        let owner = owner.unwrap();
+        let mode = mode.unwrap();
+        format!("{}:{}:0{:o}", owner.0, owner.1, mode)
+    } else {
+        let (orig_uid, orig_gid, orig_mode) = get_override_xattr(fd)?;
+        let (uid, gid) = match owner {
+            Some((uid, gid)) => {
+                let uid = if uid < UID_MAX { Some(uid) } else { orig_uid };
+                let gid = if gid < UID_MAX { Some(gid) } else { orig_gid };
+                (uid, gid)
+            }
+            None => (orig_uid, orig_gid),
+        };
+
+        let mut buf = String::new();
+        if let Some(uid) = uid {
+            buf.push_str(&uid.to_string());
+        } else {
+            buf.push('x');
+        }
+        if let Some(gid) = gid {
+            buf.push_str(&format!(":{gid}:"));
+        } else {
+            buf.push_str(":x:");
+        }
+        if let Some(mode) = mode {
+            buf.push_str(&format!("0{:o}", mode));
+        } else if let Some(orig_mode) = orig_mode {
+            buf.push_str(&format!("0{:o}", orig_mode));
+        } else {
+            buf.push('x');
+        }
+        buf
+    };
+
+    let res = unsafe {
+        libc::fsetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+        )
+    };
+    let res = if res < 0 {
+        let path = proc_fd_path(fd)?;
+        unsafe {
+            libc::setxattr(
+                path.as_ptr(),
+                XATTR_KEY.as_ptr() as *const libc::c_char,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                0,
+            )
+        }
+    } else {
+        res
+    };
+    if res < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_override_stat(
+    mut st: libc::stat64,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u32>,
+    host_uid: Option<libc::uid_t>,
+    host_gid: Option<libc::gid_t>,
+) -> libc::stat64 {
+    if let Some(uid) = uid {
+        st.st_uid = uid;
+    } else if host_uid == Some(st.st_uid) {
+        st.st_uid = 0;
+    }
+    if let Some(gid) = gid {
+        st.st_gid = gid;
+    } else if host_gid == Some(st.st_gid) {
+        st.st_gid = 0;
+    }
+    if let Some(mode) = mode {
+        if mode as libc::mode_t & libc::S_IFMT == 0 {
+            st.st_mode = (st.st_mode & libc::S_IFMT) | mode as libc::mode_t;
+        } else {
+            st.st_mode = mode as libc::mode_t;
+        }
+    }
+    st
+}
+
+fn host_stat_fd(fd: RawFd) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
     // Safe because this is a constant value and a valid C string.
@@ -169,7 +372,7 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     // value.
     let res = unsafe {
         libc::fstatat64(
-            f.as_raw_fd(),
+            fd,
             pathname.as_ptr(),
             st.as_mut_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
@@ -181,6 +384,20 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn host_stat(f: &File) -> io::Result<libc::stat64> {
+    host_stat_fd(f.as_raw_fd())
+}
+
+fn stat(
+    f: &File,
+    host_uid: Option<libc::uid_t>,
+    host_gid: Option<libc::gid_t>,
+) -> io::Result<libc::stat64> {
+    let st = host_stat(f)?;
+    let (uid, gid, mode) = get_override_xattr(f.as_raw_fd())?;
+    Ok(apply_override_stat(st, uid, gid, mode, host_uid, host_gid))
 }
 
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
@@ -554,6 +771,8 @@ impl PassthroughFs {
         let f = unsafe { File::from_raw_fd(fd) };
 
         let (st, mnt_id) = statx(&f)?;
+        let (uid, gid, mode) = get_override_xattr(f.as_raw_fd())?;
+        let attr = apply_override_stat(st, uid, gid, mode, self.my_uid, self.my_gid);
 
         let mut attr_flags: u32 = 0;
 
@@ -604,7 +823,7 @@ impl PassthroughFs {
         Ok(Entry {
             inode,
             generation: 0,
-            attr: st,
+            attr,
             attr_flags,
             attr_timeout: self.cfg.attr_timeout,
             entry_timeout: self.cfg.entry_timeout,
@@ -807,9 +1026,26 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = stat(&data.file)?;
+        let st = stat(&data.file, self.my_uid, self.my_gid)?;
 
         Ok((st, self.cfg.attr_timeout))
+    }
+
+    fn set_guest_owner(&self, inode: Inode, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        set_override_xattr(data.file.as_raw_fd(), Some((uid, gid)), None)
+    }
+
+    fn refresh_entry_attr(&self, mut entry: Entry) -> io::Result<Entry> {
+        let (attr, _) = self.do_getattr(entry.inode)?;
+        entry.attr = attr;
+        Ok(entry)
     }
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
@@ -1071,7 +1307,9 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res == 0 {
-            self.do_lookup(parent, name)
+            let entry = self.do_lookup(parent, name)?;
+            self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+            self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -1198,6 +1436,8 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.do_lookup(parent, name)?;
+        self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+        let entry = self.refresh_entry_attr(entry)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
@@ -1374,22 +1614,7 @@ impl FileSystem for PassthroughFs {
                 u32::MAX
             };
 
-            // Safe because this is a constant value and a valid C string.
-            let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
-                libc::fchownat(
-                    inode_data.file.as_raw_fd(),
-                    empty.as_ptr(),
-                    uid,
-                    gid,
-                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            set_override_xattr(inode_data.file.as_raw_fd(), Some((uid, gid)), None)?;
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -1528,7 +1753,9 @@ impl FileSystem for PassthroughFs {
         if res < 0 {
             Err(io::Error::last_os_error())
         } else {
-            self.do_lookup(parent, name)
+            let entry = self.do_lookup(parent, name)?;
+            self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+            self.refresh_entry_attr(entry)
         }
     }
 
@@ -1600,7 +1827,9 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
-            self.do_lookup(parent, name)
+            let entry = self.do_lookup(parent, name)?;
+            self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+            self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -1717,7 +1946,7 @@ impl FileSystem for PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = stat(&data.file)?;
+        let st = stat(&data.file, self.my_uid, self.my_gid)?;
         let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
 
         if mode == libc::F_OK {
