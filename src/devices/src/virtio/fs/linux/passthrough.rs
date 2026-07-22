@@ -250,6 +250,14 @@ fn is_missing_override_stat_error(code: i32) -> bool {
         || code == libc::EBADF
 }
 
+fn should_store_override_stat_for_setattr_error(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code) if
+        code == libc::EINVAL
+            || code == libc::EPERM
+            || code == libc::ENOTSUP
+            || code == libc::EOPNOTSUPP)
+}
+
 fn has_override_stat_fd(fd: RawFd) -> io::Result<bool> {
     let res = unsafe {
         libc::fgetxattr(
@@ -456,6 +464,46 @@ fn set_override_stat_path(
 
 fn clear_suid_sgid(mode: u32) -> u32 {
     mode & !((libc::S_ISUID | libc::S_ISGID) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setattr_override_stat_errors_are_only_metadata_backend_errors() {
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::ENOTSUP)
+        ));
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EOPNOTSUPP)
+        ));
+
+        assert!(!should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EROFS)
+        ));
+        assert!(!should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn override_stat_value_preserves_fields_not_requested_by_chown() {
+        let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+        st.st_uid = 10;
+        st.st_gid = 20;
+        st.st_mode = libc::S_IFREG | 0o644;
+
+        let value = override_stat_value(st, (None, None, None), Some((100, u32::MAX)), None);
+
+        assert_eq!(value, "100:20:0644");
+    }
 }
 
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
@@ -1634,7 +1682,7 @@ impl FileSystem for PassthroughFs {
             Data::ProcPath(pathname)
         };
 
-        let use_override_stat = match data {
+        let mut use_override_stat = match data {
             Data::Handle(fd) => has_override_stat_fd(fd)?,
             Data::ProcPath(ref p) => has_override_stat_path(p)?,
         };
@@ -1657,7 +1705,20 @@ impl FileSystem for PassthroughFs {
                     }
                 };
                 if res < 0 {
-                    return Err(io::Error::last_os_error());
+                    let err = io::Error::last_os_error();
+                    if !should_store_override_stat_for_setattr_error(&err) {
+                        return Err(err);
+                    }
+
+                    match data {
+                        Data::Handle(fd) => {
+                            set_override_stat_fd(fd, None, None, Some(attr.st_mode))?
+                        }
+                        Data::ProcPath(ref p) => {
+                            set_override_stat_path(p, None, None, Some(attr.st_mode))?
+                        }
+                    };
+                    use_override_stat = true;
                 }
             }
         }
@@ -1704,7 +1765,26 @@ impl FileSystem for PassthroughFs {
                     )
                 };
                 if res < 0 {
-                    return Err(io::Error::last_os_error());
+                    let err = io::Error::last_os_error();
+                    if !should_store_override_stat_for_setattr_error(&err) {
+                        return Err(err);
+                    }
+
+                    let st = stat(&inode_data.file)?;
+                    let new_mode = clear_suid_sgid(st.st_mode);
+                    let new_mode = if new_mode != st.st_mode {
+                        Some(new_mode)
+                    } else {
+                        None
+                    };
+                    match data {
+                        Data::Handle(fd) => {
+                            set_override_stat_fd(fd, Some(st), Some((uid, gid)), new_mode)?
+                        }
+                        Data::ProcPath(ref p) => {
+                            set_override_stat_path(p, Some(st), Some((uid, gid)), new_mode)?
+                        }
+                    };
                 }
             }
         }
