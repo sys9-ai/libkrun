@@ -32,6 +32,9 @@ const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
+const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+
+const UID_MAX: u32 = u32::MAX - 1;
 
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 
@@ -159,7 +162,153 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
-fn stat(f: &File) -> io::Result<libc::stat64> {
+fn item_to_value(item: &[u8], radix: u32) -> Option<u32> {
+    match std::str::from_utf8(item) {
+        Ok("x") => None,
+        Ok(val) => match u32::from_str_radix(val, radix) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                debug!("invalid override_stat value: {val} radix={radix} err={e}");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+fn get_override_stat_common(buf: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let mut items = buf.split(|c| *c == b':');
+
+    let uid = match items.next() {
+        Some(item) => item_to_value(item, 10),
+        None => None,
+    };
+    let gid = match items.next() {
+        Some(item) => item_to_value(item, 10),
+        None => None,
+    };
+    let mode = match items.next() {
+        Some(item) => item_to_value(item, 8),
+        None => None,
+    };
+
+    (uid, gid, mode)
+}
+
+fn proc_fd_path(fd: RawFd) -> io::Result<CString> {
+    CString::new(format!("/proc/self/fd/{fd}"))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn get_override_stat_fd(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let mut buf: Vec<u8> = vec![0; 32];
+    let res = unsafe {
+        libc::fgetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if res < 0 {
+        debug!("fgetxattr override_stat error: {res}");
+        return Ok((None, None, None));
+    }
+
+    buf.resize(res as usize, 0);
+    Ok(get_override_stat_common(&buf))
+}
+
+fn get_override_stat_path(path: &CStr) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let mut buf: Vec<u8> = vec![0; 32];
+    let res = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if res < 0 {
+        debug!("getxattr override_stat error: {res}");
+        return Ok((None, None, None));
+    }
+
+    buf.resize(res as usize, 0);
+    Ok(get_override_stat_common(&buf))
+}
+
+fn get_override_stat_file(f: &File) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let path = proc_fd_path(f.as_raw_fd())?;
+    get_override_stat_path(&path)
+}
+
+fn is_missing_override_stat_error(code: i32) -> bool {
+    code == libc::ENODATA
+        || code == libc::ENOTSUP
+        || code == libc::EOPNOTSUPP
+        || code == libc::EBADF
+}
+
+fn has_override_stat_fd(fd: RawFd) -> io::Result<bool> {
+    let res = unsafe {
+        libc::fgetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res >= 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if is_missing_override_stat_error(code) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+fn has_override_stat_path(path: &CStr) -> io::Result<bool> {
+    let res = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res >= 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if is_missing_override_stat_error(code) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+fn apply_override_stat(
+    mut st: libc::stat64,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    mode: Option<u32>,
+) -> libc::stat64 {
+    if let Some(uid) = uid {
+        st.st_uid = uid;
+    }
+    if let Some(gid) = gid {
+        st.st_gid = gid;
+    }
+    if let Some(mode) = mode {
+        st.st_mode = (st.st_mode & libc::S_IFMT) | (mode & 0o7777);
+    }
+    st
+}
+
+fn host_stat(f: &File) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
     // Safe because this is a constant value and a valid C string.
@@ -181,6 +330,132 @@ fn stat(f: &File) -> io::Result<libc::stat64> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+fn stat(f: &File) -> io::Result<libc::stat64> {
+    let st = host_stat(f)?;
+    let (uid, gid, mode) = get_override_stat_file(f)?;
+    Ok(apply_override_stat(st, uid, gid, mode))
+}
+
+fn host_stat_path(path: &CStr) -> io::Result<libc::stat64> {
+    let mut st = MaybeUninit::<libc::stat64>::zeroed();
+    let res = unsafe { libc::stat64(path.as_ptr(), st.as_mut_ptr()) };
+    if res >= 0 {
+        Ok(unsafe { st.assume_init() })
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn host_fstat(fd: RawFd) -> io::Result<libc::stat64> {
+    let mut st = MaybeUninit::<libc::stat64>::zeroed();
+    let res = unsafe { libc::fstat64(fd, st.as_mut_ptr()) };
+    if res >= 0 {
+        Ok(unsafe { st.assume_init() })
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn valid_owner(owner: Option<(u32, u32)>) -> bool {
+    if let Some(owner) = owner {
+        owner.0 < UID_MAX && owner.1 < UID_MAX
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::unnecessary_unwrap)]
+fn override_stat_value(
+    st: libc::stat64,
+    current: (Option<u32>, Option<u32>, Option<u32>),
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> String {
+    if valid_owner(owner) && mode.is_some() {
+        let owner = owner.unwrap();
+        let mode = mode.unwrap() & 0o7777;
+        return format!("{}:{}:{:04o}", owner.0, owner.1, mode);
+    }
+
+    let (current_uid, current_gid, current_mode) = current;
+    let (uid, gid) = match owner {
+        Some(owner) => {
+            let uid = if owner.0 < UID_MAX {
+                Some(owner.0)
+            } else {
+                current_uid
+            };
+            let gid = if owner.1 < UID_MAX {
+                Some(owner.1)
+            } else {
+                current_gid
+            };
+            (uid, gid)
+        }
+        None => (current_uid, current_gid),
+    };
+
+    let uid = uid.unwrap_or(st.st_uid);
+    let gid = gid.unwrap_or(st.st_gid);
+    let mode = mode.or(current_mode).unwrap_or(st.st_mode & 0o7777) & 0o7777;
+
+    format!("{uid}:{gid}:{mode:04o}")
+}
+
+fn set_override_stat_fd(
+    fd: RawFd,
+    st: Option<libc::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    let st = st.unwrap_or(host_fstat(fd)?);
+    let current = get_override_stat_fd(fd)?;
+    let value = override_stat_value(st, current, owner, mode);
+    let res = unsafe {
+        libc::fsetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn set_override_stat_path(
+    path: &CStr,
+    st: Option<libc::stat64>,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<()> {
+    let st = st.unwrap_or(host_stat_path(path)?);
+    let current = get_override_stat_path(path)?;
+    let value = override_stat_value(st, current, owner, mode);
+    let res = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn clear_suid_sgid(mode: u32) -> u32 {
+    mode & !((libc::S_ISUID | libc::S_ISGID) as u32)
 }
 
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
@@ -227,7 +502,8 @@ fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
         st.st_mtime_nsec = stx.stx_mtime.tv_nsec as _;
         st.st_ctime = stx.stx_ctime.tv_sec;
         st.st_ctime_nsec = stx.stx_ctime.tv_nsec as _;
-        Ok((st, stx.stx_mnt_id))
+        let (uid, gid, mode) = get_override_stat_file(f)?;
+        Ok((apply_override_stat(st, uid, gid, mode), stx.stx_mnt_id))
     } else {
         Err(io::Error::last_os_error())
     }
@@ -1293,7 +1569,21 @@ impl FileSystem for PassthroughFs {
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
         let f = data.file.read().unwrap();
-        r.read_to(&f, size as usize, offset)
+        let result = r.read_to(&f, size as usize, offset);
+
+        if result.is_ok() && kill_priv && has_override_stat_fd(f.as_raw_fd()).unwrap_or(false) {
+            let fd = f.as_raw_fd();
+            if let Ok(st) = stat(&f) {
+                let new_mode = clear_suid_sgid(st.st_mode);
+                if new_mode != st.st_mode {
+                    if let Err(err) = set_override_stat_fd(fd, Some(st), None, Some(new_mode)) {
+                        error!("couldn't clear suid/sgid override_stat for inode {inode}: {err}");
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     fn getattr(
@@ -1340,23 +1630,35 @@ impl FileSystem for PassthroughFs {
             let fd = hd.file.write().unwrap().as_raw_fd();
             Data::Handle(fd)
         } else {
-            let pathname = CString::new(format!("{}", inode_data.file.as_raw_fd()))
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let pathname = proc_fd_path(inode_data.file.as_raw_fd())?;
             Data::ProcPath(pathname)
         };
 
+        let use_override_stat = match data {
+            Data::Handle(fd) => has_override_stat_fd(fd)?,
+            Data::ProcPath(ref p) => has_override_stat_path(p)?,
+        };
+
         if valid.contains(SetattrValid::MODE) {
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
+            if use_override_stat {
                 match data {
-                    Data::Handle(fd) => libc::fchmod(fd, attr.st_mode),
+                    Data::Handle(fd) => set_override_stat_fd(fd, None, None, Some(attr.st_mode))?,
                     Data::ProcPath(ref p) => {
-                        libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
+                        set_override_stat_path(p, None, None, Some(attr.st_mode))?
                     }
+                };
+            } else {
+                let res = unsafe {
+                    match data {
+                        Data::Handle(fd) => libc::fchmod(fd, attr.st_mode),
+                        Data::ProcPath(ref p) => {
+                            libc::fchmodat(libc::AT_FDCWD, p.as_ptr(), attr.st_mode, 0)
+                        }
+                    }
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
                 }
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
             }
         }
 
@@ -1374,21 +1676,36 @@ impl FileSystem for PassthroughFs {
                 u32::MAX
             };
 
-            // Safe because this is a constant value and a valid C string.
-            let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
-                libc::fchownat(
-                    inode_data.file.as_raw_fd(),
-                    empty.as_ptr(),
-                    uid,
-                    gid,
-                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
+            if use_override_stat {
+                let st = stat(&inode_data.file)?;
+                let new_mode = clear_suid_sgid(st.st_mode);
+                let new_mode = if new_mode != st.st_mode {
+                    Some(new_mode)
+                } else {
+                    None
+                };
+                match data {
+                    Data::Handle(fd) => {
+                        set_override_stat_fd(fd, Some(st), Some((uid, gid)), new_mode)?
+                    }
+                    Data::ProcPath(ref p) => {
+                        set_override_stat_path(p, Some(st), Some((uid, gid)), new_mode)?
+                    }
+                };
+            } else {
+                let empty = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+                let res = unsafe {
+                    libc::fchownat(
+                        inode_data.file.as_raw_fd(),
+                        empty.as_ptr(),
+                        uid,
+                        gid,
+                        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
         }
 
@@ -1437,7 +1754,7 @@ impl FileSystem for PassthroughFs {
             let res = match data {
                 Data::Handle(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
                 Data::ProcPath(ref p) => unsafe {
-                    libc::utimensat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
+                    libc::utimensat(libc::AT_FDCWD, p.as_ptr(), tvs.as_ptr(), 0)
                 },
             };
             if res < 0 {
