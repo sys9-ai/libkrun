@@ -73,54 +73,6 @@ struct LinuxDirent64 {
 }
 unsafe impl ByteValued for LinuxDirent64 {}
 
-macro_rules! scoped_cred {
-    ($name:ident, $ty:ty, $syscall_nr:expr) => {
-        #[derive(Debug)]
-        struct $name;
-
-        impl $name {
-            // Changes the effective uid/gid of the current thread to `val`.  Changes
-            // the thread's credentials back to root when the returned struct is dropped.
-            fn new(val: $ty) -> io::Result<Option<$name>> {
-                // We want credential changes to be per-thread because otherwise
-                // we might interfere with operations being carried out on other
-                // threads with different uids/gids.  However, posix requires that
-                // all threads in a process share the same credentials.  To do this
-                // libc uses signals to ensure that when one thread changes its
-                // credentials the other threads do the same thing.
-                //
-                // So instead we invoke the syscall directly in order to get around
-                // this limitation.  Another option is to use the setfsuid and
-                // setfsgid systems calls.   However since those calls have no way to
-                // return an error, it's preferable to do this instead.
-
-                // This call is safe because it doesn't modify any memory and we
-                // check the return value.
-                let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
-                if res == 0 {
-                    Ok(Some($name))
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
-        }
-
-        impl Drop for $name {
-            fn drop(&mut self) {
-                let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
-                if res < 0 {
-                    error!(
-                        "failed to change credentials back to root: {}",
-                        io::Error::last_os_error(),
-                    );
-                }
-            }
-        }
-    };
-}
-scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
-scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
-
 #[must_use]
 pub struct ScopedCaps {
     cap: Capability,
@@ -189,6 +141,55 @@ mod tests {
         assert_eq!(uid, Some(0));
         assert_eq!(gid, Some(0));
         assert_eq!(mode, Some(0o755));
+    }
+
+    #[test]
+    fn override_xattr_mode_update_keeps_existing_owner() {
+        let dir = unique_tmp_dir("override-mode-keeps-owner");
+        let path = dir.join("file");
+        let file = File::create(&path).unwrap();
+
+        set_override_xattr(file.as_raw_fd(), Some((33, 44)), None).unwrap();
+        set_override_xattr(file.as_raw_fd(), None, Some(0o4755)).unwrap();
+        let (uid, gid, mode) = get_override_xattr(file.as_raw_fd()).unwrap();
+
+        assert_eq!(uid, Some(33));
+        assert_eq!(gid, Some(44));
+        assert_eq!(mode, Some(0o4755));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_suid_sgid_removes_only_setid_bits() {
+        assert_eq!(clear_suid_sgid(0o6755), 0o0755);
+        assert_eq!(
+            clear_suid_sgid(libc::S_IFREG | 0o6755),
+            libc::S_IFREG | 0o0755
+        );
+        assert_eq!(
+            clear_suid_sgid(libc::S_IFDIR | 0o1777),
+            libc::S_IFDIR | 0o1777
+        );
+    }
+
+    #[test]
+    fn setattr_mode_fallback_is_limited_to_metadata_backend_errors() {
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EINVAL)
+        ));
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EPERM)
+        ));
+        assert!(should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::ENOTSUP)
+        ));
+        assert!(!should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::ENOENT)
+        ));
+        assert!(!should_store_override_stat_for_setattr_error(
+            &io::Error::from_raw_os_error(libc::EIO)
+        ));
     }
 
     #[test]
@@ -320,6 +321,65 @@ fn get_override_xattr(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option
 
     buf.resize(res as usize, 0);
     Ok(get_xattr_common(&buf))
+}
+
+fn is_missing_override_xattr_error(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code) if
+        code == libc::ENODATA
+            || code == libc::ENOTSUP
+            || code == libc::EOPNOTSUPP
+            || code == libc::EBADF)
+}
+
+fn has_override_xattr(fd: RawFd) -> io::Result<bool> {
+    if host_fd_is_symlink(fd)? {
+        return Ok(false);
+    }
+
+    let res = unsafe {
+        libc::fgetxattr(
+            fd,
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res >= 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    if !is_missing_override_xattr_error(&err) {
+        return Err(err);
+    }
+
+    let path = proc_fd_path(fd)?;
+    let res = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            XATTR_KEY.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if res >= 0 {
+        return Ok(true);
+    }
+
+    let err = io::Error::last_os_error();
+    if is_missing_override_xattr_error(&err) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+fn should_store_override_stat_for_setattr_error(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code) if
+        code == libc::EINVAL
+            || code == libc::EPERM
+            || code == libc::ENOTSUP
+            || code == libc::EOPNOTSUPP)
 }
 
 fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
@@ -515,6 +575,10 @@ fn host_stat(f: &File) -> io::Result<libc::stat64> {
 
 fn host_fd_is_symlink(fd: RawFd) -> io::Result<bool> {
     Ok(host_stat_fd(fd)?.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+fn clear_suid_sgid(mode: libc::mode_t) -> libc::mode_t {
+    mode & !((libc::S_ISUID | libc::S_ISGID) as libc::mode_t)
 }
 
 fn stat(
@@ -1204,6 +1268,56 @@ impl PassthroughFs {
         Ok(entry)
     }
 
+    fn check_access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+
+        let st = stat(&data.file, self.my_uid, self.my_gid)?;
+        let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
+
+        if mode == libc::F_OK {
+            return Ok(());
+        }
+
+        if (mode & libc::R_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
+            && st.st_mode & 0o004 == 0
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+
+        if (mode & libc::W_OK) != 0
+            && ctx.uid != 0
+            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
+            && st.st_mode & 0o002 == 0
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+
+        if (mode & libc::X_OK) != 0
+            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
+            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
+            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
+            && st.st_mode & 0o001 == 0
+        {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+
+        Ok(())
+    }
+
+    fn check_create_access(&self, ctx: &Context, parent: Inode) -> io::Result<()> {
+        self.check_access(ctx, parent, (libc::W_OK | libc::X_OK) as u32)
+    }
+
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
         let data = self
             .inodes
@@ -1220,37 +1334,6 @@ impl PassthroughFs {
         } else {
             Err(io::Error::last_os_error())
         }
-    }
-
-    fn set_creds(
-        &self,
-        uid: libc::uid_t,
-        gid: libc::gid_t,
-    ) -> io::Result<(Option<ScopedUid>, Option<ScopedGid>)> {
-        // Change the gid first, since once we change the uid we lose the capability to change the gid.
-        let scoped_gid = if gid == 0 || self.my_gid == Some(gid) {
-            // Always allow "root" accesses even if we don't have root powers.
-            // This means guest processes running as root can use /tmp (though
-            // the files will not be actually owned by root), which is desirable.
-            None
-        } else if self.my_gid.is_some() {
-            // Reject writes as any other gid if we do not have setgid
-            // privileges.
-            return Err(io::Error::from_raw_os_error(libc::EPERM));
-        } else {
-            ScopedGid::new(gid)?
-        };
-
-        // Same logic as above, for uid.
-        let scoped_uid = if uid == 0 || self.my_uid == Some(uid) {
-            None
-        } else if self.my_uid.is_some() {
-            return Err(io::Error::from_raw_os_error(libc::EPERM));
-        } else {
-            ScopedUid::new(uid)?
-        };
-
-        Ok((scoped_uid, scoped_gid))
     }
 }
 
@@ -1451,7 +1534,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        let (_uid, _gid) = self.set_creds(ctx.uid, ctx.gid)?;
+        self.check_create_access(&ctx, parent)?;
         let data = self
             .inodes
             .read()
@@ -1558,7 +1641,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        let (_uid, _gid) = self.set_creds(ctx.uid, ctx.gid)?;
+        self.check_create_access(&ctx, parent)?;
         let _killpriv_guard = if kill_priv {
             drop_effective_cap(Capability::CAP_FSETID)?
         } else {
@@ -1689,7 +1772,15 @@ impl FileSystem for PassthroughFs {
         // This is safe because read_to uses pwritev64, so the underlying file descriptor
         // offset is not affected by this operation.
         let f = data.file.read().unwrap();
-        r.read_to(&f, size as usize, offset)
+        let result = r.read_to(&f, size as usize, offset);
+        if result.is_ok() && kill_priv && has_override_xattr(f.as_raw_fd())? {
+            let st = stat(&f, self.my_uid, self.my_gid)?;
+            let mode = clear_suid_sgid(st.st_mode);
+            if mode != st.st_mode {
+                set_override_xattr(f.as_raw_fd(), None, Some(mode))?;
+            }
+        }
+        result
     }
 
     fn getattr(
@@ -1741,18 +1832,31 @@ impl FileSystem for PassthroughFs {
             Data::ProcPath(pathname)
         };
 
+        let inode_fd = inode_data.file.as_raw_fd();
         if valid.contains(SetattrValid::MODE) {
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res = unsafe {
-                match data {
-                    Data::Handle(fd) => libc::fchmod(fd, attr.st_mode),
-                    Data::ProcPath(ref p) => {
-                        libc::fchmodat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), attr.st_mode, 0)
+            if has_override_xattr(inode_fd)? {
+                set_override_xattr(inode_fd, None, Some(attr.st_mode))?;
+            } else {
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    match data {
+                        Data::Handle(fd) => libc::fchmod(fd, attr.st_mode),
+                        Data::ProcPath(ref p) => libc::fchmodat(
+                            self.proc_self_fd.as_raw_fd(),
+                            p.as_ptr(),
+                            attr.st_mode,
+                            0,
+                        ),
+                    }
+                };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if should_store_override_stat_for_setattr_error(&err) {
+                        set_override_xattr(inode_fd, None, Some(attr.st_mode))?;
+                    } else {
+                        return Err(err);
                     }
                 }
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
             }
         }
 
@@ -1770,7 +1874,10 @@ impl FileSystem for PassthroughFs {
                 u32::MAX
             };
 
-            set_override_xattr(inode_data.file.as_raw_fd(), Some((uid, gid)), None)?;
+            let st = stat(&inode_data.file, self.my_uid, self.my_gid)?;
+            let mode = clear_suid_sgid(st.st_mode);
+            let mode = if mode != st.st_mode { Some(mode) } else { None };
+            set_override_xattr(inode_fd, Some((uid, gid)), mode)?;
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -1887,7 +1994,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        let (_uid, _gid) = self.set_creds(ctx.uid, ctx.gid)?;
+        self.check_create_access(&ctx, parent)?;
         let data = self
             .inodes
             .read()
@@ -1970,7 +2077,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        let (_uid, _gid) = self.set_creds(ctx.uid, ctx.gid)?;
+        self.check_create_access(&ctx, parent)?;
         let data = self
             .inodes
             .read()
@@ -2094,59 +2201,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        let data = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        let st = stat(&data.file, self.my_uid, self.my_gid)?;
-        let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
-
-        if mode == libc::F_OK {
-            // The file exists since we were able to call `stat(2)` on it.
-            return Ok(());
-        }
-
-        // We use ctx.uid/ctx.gid for these checks, but when idmapped mounts
-        // support is enabled on the guest side, it means that "default_permissions"
-        // flag is set on virtiofs mount and FUSE_ACCESS request should never be
-        // sent to the userspace. Please, refer to the kernel commit
-        // ("fs/fuse: warn if fuse_access is called when idmapped mounts are allowed").
-        // In case when idmapped mounts are not enabled we are good to rely on ctx.uid/ctx.gid values.
-
-        if (mode & libc::R_OK) != 0
-            && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
-            && st.st_mode & 0o004 == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-
-        if (mode & libc::W_OK) != 0
-            && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
-            && st.st_mode & 0o002 == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-
-        // root can only execute something if it is executable by one of the owner, the group, or
-        // everyone.
-        if (mode & libc::X_OK) != 0
-            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
-            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
-            && st.st_mode & 0o001 == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-
-        Ok(())
+        self.check_access(&ctx, inode, mask)
     }
 
     fn setxattr(
