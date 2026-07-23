@@ -1628,7 +1628,7 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let mut create_mode = mode & !umask;
         if inherits_group {
-            create_mode |= libc::S_ISGID as u32;
+            create_mode |= libc::S_ISGID;
         }
         let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode) };
         if res == 0 {
