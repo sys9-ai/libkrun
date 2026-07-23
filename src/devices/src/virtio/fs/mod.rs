@@ -45,7 +45,7 @@ mod defs {
     }
 }
 
-use std::ffi::{FromBytesWithNulError, FromVecWithNulError};
+use std::ffi::FromBytesWithNulError;
 use std::io;
 
 use descriptor_utils::Error as DescriptorError;
@@ -58,13 +58,10 @@ pub enum FsError {
     EncodeMessage(io::Error),
     /// Failed to create event fd.
     EventFd(std::io::Error),
-    /// The guest failed to send a require extensions.
-    MissingExtension,
     /// One or more parameters are missing.
     MissingParameter,
     /// A C string parameter is invalid.
     InvalidCString(FromBytesWithNulError),
-    InvalidCString2(FromVecWithNulError),
     /// The `len` field of the header is too small.
     InvalidHeaderLength,
     /// The `size` field of the `SetxattrIn` message does not match the length

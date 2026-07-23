@@ -306,7 +306,11 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len() + linkname.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len() + linkname.len(), buf.as_slice())
+        {
+            Ok(extensions) => extensions,
+            Err(e) => return reply_error(linux_error(e), in_header.unique, w),
+        };
 
         match self.fs.symlink(
             Context::from(in_header),
@@ -341,7 +345,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len(), buf.as_slice()) {
+            Ok(extensions) => extensions,
+            Err(e) => return reply_error(linux_error(e), in_header.unique, w),
+        };
 
         match self.fs.mknod(
             Context::from(in_header),
@@ -376,7 +383,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len(), buf.as_slice()) {
+            Ok(extensions) => extensions,
+            Err(e) => return reply_error(linux_error(e), in_header.unique, w),
+        };
 
         match self.fs.mkdir(
             Context::from(in_header),
@@ -896,7 +906,6 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::SUBMOUNTS
             | FsOptions::HANDLE_KILLPRIV_V2
             | FsOptions::INIT_EXT
-            | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::ALLOW_IDMAP;
 
         if cfg!(target_os = "macos") {
@@ -1119,7 +1128,10 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let options = FsOptions::from_bits_truncate(self.options.load(Ordering::Relaxed));
 
-        let extensions = get_extensions(options, name.len(), buf.as_slice())?;
+        let extensions = match get_extensions(options, name.len(), buf.as_slice()) {
+            Ok(extensions) => extensions,
+            Err(e) => return reply_error(linux_error(e), in_header.unique, w),
+        };
 
         let kill_priv = open_flags & OPEN_KILL_SUIDGID != 0;
 
@@ -1544,9 +1556,9 @@ fn add_dirent(
     }
 }
 
-fn take_object<T: ByteValued>(data: &[u8]) -> Result<(T, &[u8])> {
+fn take_object<T: ByteValued>(data: &[u8]) -> io::Result<(T, &[u8])> {
     if data.len() < size_of::<T>() {
-        return Err(Error::DecodeMessage(einval()));
+        return Err(einval());
     }
 
     let (object_bytes, remaining_bytes) = data.split_at(size_of::<T>());
@@ -1556,11 +1568,11 @@ fn take_object<T: ByteValued>(data: &[u8]) -> Result<(T, &[u8])> {
     Ok((object, remaining_bytes))
 }
 
-fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecContext>> {
+fn parse_security_context(nr_secctx: u32, data: &[u8]) -> io::Result<Option<SecContext>> {
     // Although the FUSE security context extension allows sending several security contexts,
     // currently the guest kernel only sends one.
     if nr_secctx > 1 {
-        return Err(Error::DecodeMessage(einval()));
+        return Err(einval());
     } else if nr_secctx == 0 {
         // No security context sent. May be no LSM supports it.
         return Ok(None);
@@ -1569,15 +1581,15 @@ fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecConte
     let (secctx, data) = take_object::<Secctx>(data)?;
 
     if secctx.size == 0 {
-        return Err(Error::DecodeMessage(einval()));
+        return Err(einval());
     }
 
     let mut components = data.split_inclusive(|c| *c == b'\0');
-    let secctx_name = components.next().ok_or(Error::MissingParameter)?;
+    let secctx_name = components.next().ok_or_else(einval)?;
     let (_, data) = data.split_at(secctx_name.len());
 
     if data.len() < secctx.size as usize {
-        return Err(Error::DecodeMessage(einval()));
+        return Err(einval());
     }
 
     // Fuse client aligns the whole security context block to 64 byte
@@ -1589,14 +1601,14 @@ fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecConte
     let (remaining, _) = data.split_at(secctx.size as usize);
 
     let fuse_secctx = SecContext {
-        name: CString::from_vec_with_nul(secctx_name.to_vec()).map_err(Error::InvalidCString2)?,
+        name: CString::from_vec_with_nul(secctx_name.to_vec()).map_err(|_| einval())?,
         secctx: remaining.to_vec(),
     };
 
     Ok(Some(fuse_secctx))
 }
 
-fn parse_sup_groups(data: &[u8]) -> Result<Vec<u32>> {
+fn parse_sup_groups(data: &[u8]) -> io::Result<Vec<u32>> {
     const LINUX_NGROUPS_MAX: u32 = 65536;
 
     let (group_header, mut group_id_bytes) = take_object::<SuppGroups>(data)?;
@@ -1604,12 +1616,12 @@ fn parse_sup_groups(data: &[u8]) -> Result<Vec<u32>> {
         .checked_add(
             size_of::<u32>()
                 .checked_mul(group_header.nr_groups as usize)
-                .ok_or_else(|| Error::DecodeMessage(einval()))?,
+                .ok_or_else(einval)?,
         )
-        .ok_or_else(|| Error::DecodeMessage(einval()))?;
+        .ok_or_else(einval)?;
     if group_header.nr_groups > LINUX_NGROUPS_MAX || data.len() != unpadded_size.next_multiple_of(8)
     {
-        return Err(Error::DecodeMessage(einval()));
+        return Err(einval());
     }
 
     let mut groups = Vec::with_capacity(group_header.nr_groups as usize);
@@ -1621,7 +1633,7 @@ fn parse_sup_groups(data: &[u8]) -> Result<Vec<u32>> {
     Ok(groups)
 }
 
-fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Result<Extensions> {
+fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> io::Result<Extensions> {
     let mut extensions = Extensions::default();
 
     if !(options.contains(FsOptions::SECURITY_CTX)
@@ -1632,7 +1644,7 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
 
     // It's not guaranty to receive an extension even if it's supported by the guest kernel
     if request_bytes.len() < skip {
-        return Err(Error::DecodeMessage(einval()));
+        return Err(einval());
     }
 
     // We need to track if a SecCtx was received, because it's valid
@@ -1646,21 +1658,20 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
 
         let extension_size = (extension_header.size as usize)
             .checked_sub(size_of::<ExtHeader>())
-            .ok_or(Error::InvalidHeaderLength)?;
+            .ok_or_else(einval)?;
         if extension_size > remaining_bytes.len() {
-            return Err(Error::DecodeMessage(einval()));
+            return Err(einval());
         }
 
         let (current_extension_bytes, next_extension_bytes) =
             remaining_bytes.split_at(extension_size);
 
-        let ext_type = ExtType::try_from(extension_header.ext_type)
-            .map_err(|_| Error::DecodeMessage(einval()))?;
+        let ext_type = ExtType::try_from(extension_header.ext_type).map_err(|_| einval())?;
 
         match ext_type {
             ExtType::SecCtx(nr_secctx) => {
                 if !options.contains(FsOptions::SECURITY_CTX) || secctx_received {
-                    return Err(Error::DecodeMessage(einval()));
+                    return Err(einval());
                 }
 
                 secctx_received = true;
@@ -1668,7 +1679,7 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
             }
             ExtType::SupGroups => {
                 if !options.contains(FsOptions::CREATE_SUPP_GROUP) || sup_groups_received {
-                    return Err(Error::DecodeMessage(einval()));
+                    return Err(einval());
                 }
                 sup_groups_received = true;
                 extensions.sup_gids = parse_sup_groups(current_extension_bytes)?;
@@ -1682,7 +1693,7 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     // The SupGroup extension can be missing, since it is only sent if needed.
     // A SecCtx is always sent in create/synlink/mknod/mkdir if supported.
     if options.contains(FsOptions::SECURITY_CTX) && !secctx_received {
-        return Err(Error::MissingExtension);
+        return Err(einval());
     }
 
     Ok(extensions)
@@ -1737,12 +1748,7 @@ mod tests {
 
         let err = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap_err();
 
-        match err {
-            Error::DecodeMessage(io_err) => {
-                assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL))
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]
@@ -1768,11 +1774,6 @@ mod tests {
 
         let err = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap_err();
 
-        match err {
-            Error::DecodeMessage(io_err) => {
-                assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL))
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 }
