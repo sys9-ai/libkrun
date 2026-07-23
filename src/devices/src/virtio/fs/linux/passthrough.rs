@@ -1542,9 +1542,6 @@ impl FileSystem for PassthroughFs {
             opts |= FsOptions::SUBMOUNTS;
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
-        if capable.contains(FsOptions::DONT_MASK) {
-            opts |= FsOptions::DONT_MASK;
-        }
         if capable.contains(FsOptions::CREATE_SUPP_GROUP) {
             opts |= FsOptions::CREATE_SUPP_GROUP;
             self.supplementary_group_extension
