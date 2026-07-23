@@ -161,6 +161,21 @@ mod tests {
     }
 
     #[test]
+    fn override_xattr_stores_inherited_setgid_metadata() {
+        let dir = unique_tmp_dir("override-setgid-metadata");
+        let file = File::open(&dir).unwrap();
+
+        set_override_xattr(file.as_raw_fd(), Some((1000, 2000)), Some(0o2750)).unwrap();
+        let (uid, gid, mode) = get_override_xattr(file.as_raw_fd()).unwrap();
+
+        assert_eq!(uid, Some(1000));
+        assert_eq!(gid, Some(2000));
+        assert_eq!(mode, Some(0o2750));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn clear_suid_sgid_removes_only_setid_bits() {
         assert_eq!(clear_suid_sgid(0o6755), 0o0755);
         assert_eq!(
@@ -206,6 +221,24 @@ mod tests {
 
         check_stat_access(&ctx, &st, (libc::W_OK | libc::X_OK) as u32, &[2000]).unwrap();
         let err = check_stat_access(&ctx, &st, (libc::W_OK | libc::X_OK) as u32, &[]).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn owner_permissions_do_not_fall_through_to_supplementary_group() {
+        let ctx = Context {
+            uid: 1000,
+            gid: 1001,
+            pid: 1,
+        };
+        let mut st: libc::stat64 = unsafe { mem::zeroed() };
+        st.st_uid = 1000;
+        st.st_gid = 2000;
+        st.st_mode = libc::S_IFDIR | 0o070;
+
+        let err =
+            check_stat_access(&ctx, &st, (libc::W_OK | libc::X_OK) as u32, &[2000]).unwrap_err();
+
         assert_eq!(err.raw_os_error(), Some(libc::EACCES));
     }
 
@@ -626,29 +659,21 @@ fn check_stat_access(
         return Ok(());
     }
 
-    let matches_group = st.st_gid == ctx.gid || supplementary_gids.contains(&st.st_gid);
-    if (mode & libc::R_OK) != 0
-        && ctx.uid != 0
-        && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
-        && (!matches_group || st.st_mode & 0o040 == 0)
-        && st.st_mode & 0o004 == 0
-    {
-        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    if ctx.uid == 0 {
+        if mode & libc::X_OK != 0 && st.st_mode & 0o111 == 0 {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
+        return Ok(());
     }
-    if (mode & libc::W_OK) != 0
-        && ctx.uid != 0
-        && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
-        && (!matches_group || st.st_mode & 0o020 == 0)
-        && st.st_mode & 0o002 == 0
-    {
-        return Err(io::Error::from_raw_os_error(libc::EACCES));
-    }
-    if (mode & libc::X_OK) != 0
-        && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
-        && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
-        && (!matches_group || st.st_mode & 0o010 == 0)
-        && st.st_mode & 0o001 == 0
-    {
+
+    let permission_bits = if st.st_uid == ctx.uid {
+        (st.st_mode >> 6) & 0o7
+    } else if st.st_gid == ctx.gid || supplementary_gids.contains(&st.st_gid) {
+        (st.st_mode >> 3) & 0o7
+    } else {
+        st.st_mode & 0o7
+    };
+    if permission_bits & mode as libc::mode_t != mode as libc::mode_t {
         return Err(io::Error::from_raw_os_error(libc::EACCES));
     }
     Ok(())
@@ -1334,7 +1359,13 @@ impl PassthroughFs {
         Ok((st, self.cfg.attr_timeout))
     }
 
-    fn set_guest_owner(&self, inode: Inode, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+    fn set_guest_metadata(
+        &self,
+        inode: Inode,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        mode: Option<u32>,
+    ) -> io::Result<()> {
         let data = self
             .inodes
             .read()
@@ -1342,7 +1373,7 @@ impl PassthroughFs {
             .get(&inode)
             .cloned()
             .ok_or_else(ebadf)?;
-        set_override_xattr(data.file.as_raw_fd(), Some((uid, gid)), None)
+        set_override_xattr(data.file.as_raw_fd(), Some((uid, gid)), mode)
     }
 
     fn refresh_entry_attr(&self, mut entry: Entry) -> io::Result<Entry> {
@@ -1633,7 +1664,7 @@ impl FileSystem for PassthroughFs {
         let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode) };
         if res == 0 {
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
+            self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(create_mode))?;
             self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())
@@ -1761,7 +1792,7 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.do_lookup(parent, name)?;
-        self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
+        self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, None)?;
         let entry = self.refresh_entry_attr(entry)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -2103,7 +2134,7 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
+            self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, None)?;
             self.refresh_entry_attr(entry)
         }
     }
@@ -2176,8 +2207,48 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
+            // Linux does not allow user xattrs on symlinks. Encode the guest
+            // owner directly in host symlink metadata before publishing the
+            // inode to the FUSE lookup table.
+            let set_owner_result = (|| -> io::Result<()> {
+                let fd = unsafe {
+                    libc::openat(
+                        data.file.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let file = unsafe { File::from_raw_fd(fd) };
+                let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
+                let res = unsafe {
+                    libc::fchownat(
+                        file.as_raw_fd(),
+                        pathname.as_ptr(),
+                        self.my_uid.unwrap_or(ctx.uid),
+                        self.my_gid.unwrap_or(guest_gid),
+                        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })();
+            if let Err(owner_err) = set_owner_result {
+                let rollback_res =
+                    unsafe { libc::unlinkat(data.file.as_raw_fd(), name.as_ptr(), 0) };
+                if rollback_res < 0 {
+                    return Err(io::Error::other(format!(
+                        "set symlink guest owner: {owner_err}; rollback unlink: {}",
+                        io::Error::last_os_error()
+                    )));
+                }
+                return Err(owner_err);
+            }
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
             self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())

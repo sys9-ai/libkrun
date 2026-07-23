@@ -1744,4 +1744,35 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
     }
+
+    #[test]
+    fn get_extensions_allows_missing_optional_supplementary_groups() {
+        let extensions = get_extensions(FsOptions::CREATE_SUPP_GROUP, 0, &[]).unwrap();
+
+        assert!(extensions.sup_gids.is_empty());
+    }
+
+    #[test]
+    fn get_extensions_ignores_extension_bytes_for_old_guests() {
+        let extensions = get_extensions(FsOptions::empty(), usize::MAX, &[]).unwrap();
+
+        assert!(extensions.sup_gids.is_empty());
+    }
+
+    #[test]
+    fn get_extensions_rejects_duplicate_supplementary_groups() {
+        let extension_size = (size_of::<ExtHeader>() + size_of::<SuppGroups>() + size_of::<u32>())
+            .next_multiple_of(8) as u32;
+        let (skip, mut request) = build_sup_groups_request(&[1000], extension_size);
+        request.extend_from_within(skip..);
+
+        let err = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap_err();
+
+        match err {
+            Error::DecodeMessage(io_err) => {
+                assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL))
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }
