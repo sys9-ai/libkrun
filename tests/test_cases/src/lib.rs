@@ -22,6 +22,9 @@ use test_multiport_console::TestMultiportConsole;
 mod test_virtiofs_root_ro;
 use test_virtiofs_root_ro::TestVirtiofsRootRo;
 
+mod test_virtiofs_root_metadata;
+use test_virtiofs_root_metadata::TestVirtiofsRootMetadata;
+
 pub enum TestOutcome {
     Pass,
     Fail(String),
@@ -77,6 +80,7 @@ pub fn test_cases() -> Vec<TestCase> {
         TestCase::new("net-gvproxy", Box::new(TestNet::new_gvproxy())),
         TestCase::new("net-vmnet-helper", Box::new(TestNet::new_vmnet_helper())),
         TestCase::new("multiport-console", Box::new(TestMultiportConsole)),
+        TestCase::new("virtiofs-root-metadata", Box::new(TestVirtiofsRootMetadata)),
         TestCase::new("virtiofs-root-ro", Box::new(TestVirtiofsRootRo)),
         TestCase::new("perf-net-passt-tx", Box::new(TestNetPerf::new_passt_tx())),
         TestCase::new("perf-net-passt-rx", Box::new(TestNetPerf::new_passt_rx())),
