@@ -110,11 +110,19 @@ mod guest {
 
             assert_owner_and_mode(&parent.join("file"), SUPPLEMENTARY_UID, SHARED_GID, 0o640);
             assert_owner_and_mode(&parent.join("dir"), SUPPLEMENTARY_UID, SHARED_GID, 0o2755);
-            assert_owner_and_mode(
-                &parent.join("symlink"),
-                SUPPLEMENTARY_UID,
-                SHARED_GID,
+            let symlink_path = parent.join("symlink");
+            assert_eq!(
+                fs::read_link(&symlink_path).expect("read created symlink"),
+                Path::new("missing-target")
+            );
+            assert_eq!(
+                fs::symlink_metadata(&symlink_path)
+                    .expect("stat created symlink")
+                    .mode()
+                    & 0o7777,
                 0o777,
+                "{} mode",
+                symlink_path.display()
             );
 
             println!("OK");

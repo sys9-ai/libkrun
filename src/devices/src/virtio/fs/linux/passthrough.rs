@@ -2195,7 +2195,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        let (guest_gid, _) = self.prepare_create(&ctx, parent, &extensions)?;
+        self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
             .read()
@@ -2208,47 +2208,6 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
-            // Linux does not allow user xattrs on symlinks. Encode the guest
-            // owner directly in host symlink metadata before publishing the
-            // inode to the FUSE lookup table.
-            let set_owner_result = (|| -> io::Result<()> {
-                let fd = unsafe {
-                    libc::openat(
-                        data.file.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let file = unsafe { File::from_raw_fd(fd) };
-                let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
-                let res = unsafe {
-                    libc::fchownat(
-                        file.as_raw_fd(),
-                        pathname.as_ptr(),
-                        self.my_uid.unwrap_or(ctx.uid),
-                        self.my_gid.unwrap_or(guest_gid),
-                        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                };
-                if res < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            })();
-            if let Err(owner_err) = set_owner_result {
-                let rollback_res =
-                    unsafe { libc::unlinkat(data.file.as_raw_fd(), name.as_ptr(), 0) };
-                if rollback_res < 0 {
-                    return Err(io::Error::other(format!(
-                        "set symlink guest owner: {owner_err}; rollback unlink: {}",
-                        io::Error::last_os_error()
-                    )));
-                }
-                return Err(owner_err);
-            }
             let entry = self.do_lookup(parent, name)?;
             self.refresh_entry_attr(entry)
         } else {
