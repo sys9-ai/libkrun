@@ -193,6 +193,40 @@ mod tests {
     }
 
     #[test]
+    fn supplementary_group_grants_directory_create_access() {
+        let ctx = Context {
+            uid: 1000,
+            gid: 1001,
+            pid: 1,
+        };
+        let mut st: libc::stat64 = unsafe { mem::zeroed() };
+        st.st_uid = 0;
+        st.st_gid = 2000;
+        st.st_mode = libc::S_IFDIR | 0o2770;
+
+        check_stat_access(&ctx, &st, (libc::W_OK | libc::X_OK) as u32, &[2000]).unwrap();
+        let err = check_stat_access(&ctx, &st, (libc::W_OK | libc::X_OK) as u32, &[]).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn setgid_parent_selects_inherited_guest_group() {
+        let ctx = Context {
+            uid: 1000,
+            gid: 1001,
+            pid: 1,
+        };
+        let mut st: libc::stat64 = unsafe { mem::zeroed() };
+        st.st_gid = 2000;
+        st.st_mode = libc::S_IFDIR | libc::S_ISGID;
+
+        assert_eq!(guest_create_gid(&ctx, &st), 2000);
+
+        st.st_mode = libc::S_IFDIR | 0o770;
+        assert_eq!(guest_create_gid(&ctx, &st), 1001);
+    }
+
+    #[test]
     fn guest_xattr_name_is_mapped_to_user_namespace() {
         let name = CStr::from_bytes_with_nul(b"security.capability\0").unwrap();
         let got = host_xattr_name_for_guest(name).unwrap();
@@ -581,6 +615,53 @@ fn clear_suid_sgid(mode: libc::mode_t) -> libc::mode_t {
     mode & !((libc::S_ISUID | libc::S_ISGID) as libc::mode_t)
 }
 
+fn check_stat_access(
+    ctx: &Context,
+    st: &libc::stat64,
+    mask: u32,
+    supplementary_gids: &[u32],
+) -> io::Result<()> {
+    let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
+    if mode == libc::F_OK {
+        return Ok(());
+    }
+
+    let matches_group = st.st_gid == ctx.gid || supplementary_gids.contains(&st.st_gid);
+    if (mode & libc::R_OK) != 0
+        && ctx.uid != 0
+        && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
+        && (!matches_group || st.st_mode & 0o040 == 0)
+        && st.st_mode & 0o004 == 0
+    {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    if (mode & libc::W_OK) != 0
+        && ctx.uid != 0
+        && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
+        && (!matches_group || st.st_mode & 0o020 == 0)
+        && st.st_mode & 0o002 == 0
+    {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    if (mode & libc::X_OK) != 0
+        && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
+        && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
+        && (!matches_group || st.st_mode & 0o010 == 0)
+        && st.st_mode & 0o001 == 0
+    {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    Ok(())
+}
+
+fn guest_create_gid(ctx: &Context, parent_attr: &libc::stat64) -> libc::gid_t {
+    if parent_attr.st_mode & libc::S_ISGID as libc::mode_t != 0 {
+        parent_attr.st_gid
+    } else {
+        ctx.gid
+    }
+}
+
 fn stat(
     f: &File,
     host_uid: Option<libc::uid_t>,
@@ -785,6 +866,7 @@ pub struct PassthroughFs {
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
+    supplementary_group_extension: AtomicBool,
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
@@ -886,6 +968,7 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            supplementary_group_extension: AtomicBool::new(false),
             my_uid,
             my_gid,
             cap_fowner,
@@ -1268,7 +1351,13 @@ impl PassthroughFs {
         Ok(entry)
     }
 
-    fn check_access(&self, ctx: &Context, inode: Inode, mask: u32) -> io::Result<()> {
+    fn check_access(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+        mask: u32,
+        supplementary_gids: &[u32],
+    ) -> io::Result<()> {
         let data = self
             .inodes
             .read()
@@ -1278,44 +1367,31 @@ impl PassthroughFs {
             .ok_or_else(ebadf)?;
 
         let st = stat(&data.file, self.my_uid, self.my_gid)?;
-        let mode = mask as i32 & (libc::R_OK | libc::W_OK | libc::X_OK);
-
-        if mode == libc::F_OK {
-            return Ok(());
-        }
-
-        if (mode & libc::R_OK) != 0
-            && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
-            && st.st_mode & 0o004 == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-
-        if (mode & libc::W_OK) != 0
-            && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
-            && st.st_mode & 0o002 == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-
-        if (mode & libc::X_OK) != 0
-            && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
-            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
-            && st.st_mode & 0o001 == 0
-        {
-            return Err(io::Error::from_raw_os_error(libc::EACCES));
-        }
-
-        Ok(())
+        check_stat_access(ctx, &st, mask, supplementary_gids)
     }
 
-    fn check_create_access(&self, ctx: &Context, parent: Inode) -> io::Result<()> {
-        self.check_access(ctx, parent, (libc::W_OK | libc::X_OK) as u32)
+    fn prepare_create(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        extensions: &Extensions,
+    ) -> io::Result<(libc::gid_t, bool)> {
+        let (parent_attr, _) = self.do_getattr(parent)?;
+        // Without FUSE_CREATE_SUPP_GROUP, the server cannot know which
+        // supplementary group authorized this request. In that case the guest
+        // VFS permission check is the only complete source of truth.
+        if self.supplementary_group_extension.load(Ordering::Relaxed) {
+            check_stat_access(
+                ctx,
+                &parent_attr,
+                (libc::W_OK | libc::X_OK) as u32,
+                &extensions.sup_gids,
+            )?;
+        }
+
+        let inherits_group = parent_attr.st_mode & libc::S_ISGID as libc::mode_t != 0;
+        let gid = guest_create_gid(ctx, &parent_attr);
+        Ok((gid, inherits_group))
     }
 
     fn do_unlink(&self, parent: Inode, name: &CStr, flags: libc::c_int) -> io::Result<()> {
@@ -1435,6 +1511,10 @@ impl FileSystem for PassthroughFs {
             opts |= FsOptions::SUBMOUNTS;
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
+        self.supplementary_group_extension.store(
+            capable.contains(FsOptions::CREATE_SUPP_GROUP),
+            Ordering::Relaxed,
+        );
 
         Ok(opts)
     }
@@ -1442,6 +1522,8 @@ impl FileSystem for PassthroughFs {
     fn destroy(&self) {
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
+        self.supplementary_group_extension
+            .store(false, Ordering::Relaxed);
     }
 
     fn statfs(&self, _ctx: Context, inode: Inode) -> io::Result<libc::statvfs64> {
@@ -1534,7 +1616,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        self.check_create_access(&ctx, parent)?;
+        let (guest_gid, inherits_group) = self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
             .read()
@@ -1544,10 +1626,14 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), mode & !umask) };
+        let mut create_mode = mode & !umask;
+        if inherits_group {
+            create_mode |= libc::S_ISGID as u32;
+        }
+        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode) };
         if res == 0 {
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+            self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
             self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())
@@ -1641,7 +1727,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        self.check_create_access(&ctx, parent)?;
+        let (guest_gid, _) = self.prepare_create(&ctx, parent, &extensions)?;
         let _killpriv_guard = if kill_priv {
             drop_effective_cap(Capability::CAP_FSETID)?
         } else {
@@ -1675,7 +1761,7 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.do_lookup(parent, name)?;
-        self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+        self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
         let entry = self.refresh_entry_attr(entry)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -1994,7 +2080,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        self.check_create_access(&ctx, parent)?;
+        let (guest_gid, _) = self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
             .read()
@@ -2017,7 +2103,7 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+            self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
             self.refresh_entry_attr(entry)
         }
     }
@@ -2077,7 +2163,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
-        self.check_create_access(&ctx, parent)?;
+        let (guest_gid, _) = self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
             .read()
@@ -2091,7 +2177,7 @@ impl FileSystem for PassthroughFs {
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_owner(entry.inode, ctx.uid, ctx.gid)?;
+            self.set_guest_owner(entry.inode, ctx.uid, guest_gid)?;
             self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())
@@ -2201,7 +2287,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
-        self.check_access(&ctx, inode, mask)
+        self.check_access(&ctx, inode, mask, &[])
     }
 
     fn setxattr(

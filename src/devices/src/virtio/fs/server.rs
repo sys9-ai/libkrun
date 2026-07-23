@@ -896,6 +896,7 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::SUBMOUNTS
             | FsOptions::HANDLE_KILLPRIV_V2
             | FsOptions::INIT_EXT
+            | FsOptions::CREATE_SUPP_GROUP
             | FsOptions::ALLOW_IDMAP;
 
         if cfg!(target_os = "macos") {
@@ -1595,6 +1596,31 @@ fn parse_security_context(nr_secctx: u32, data: &[u8]) -> Result<Option<SecConte
     Ok(Some(fuse_secctx))
 }
 
+fn parse_sup_groups(data: &[u8]) -> Result<Vec<u32>> {
+    const LINUX_NGROUPS_MAX: u32 = 65536;
+
+    let (group_header, mut group_id_bytes) = take_object::<SuppGroups>(data)?;
+    let unpadded_size = size_of::<SuppGroups>()
+        .checked_add(
+            size_of::<u32>()
+                .checked_mul(group_header.nr_groups as usize)
+                .ok_or_else(|| Error::DecodeMessage(einval()))?,
+        )
+        .ok_or_else(|| Error::DecodeMessage(einval()))?;
+    if group_header.nr_groups > LINUX_NGROUPS_MAX || data.len() != unpadded_size.next_multiple_of(8)
+    {
+        return Err(Error::DecodeMessage(einval()));
+    }
+
+    let mut groups = Vec::with_capacity(group_header.nr_groups as usize);
+    while groups.len() < group_header.nr_groups as usize {
+        let gid;
+        (gid, group_id_bytes) = take_object::<u32>(group_id_bytes)?;
+        groups.push(gid);
+    }
+    Ok(groups)
+}
+
 fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Result<Extensions> {
     let mut extensions = Extensions::default();
 
@@ -1612,6 +1638,7 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     // We need to track if a SecCtx was received, because it's valid
     // for the guest to send an empty SecCtx (i.e, nr_secctx == 0)
     let mut secctx_received = false;
+    let mut sup_groups_received = false;
 
     let mut buf = &request_bytes[skip..];
     while !buf.is_empty() {
@@ -1620,6 +1647,9 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
         let extension_size = (extension_header.size as usize)
             .checked_sub(size_of::<ExtHeader>())
             .ok_or(Error::InvalidHeaderLength)?;
+        if extension_size > remaining_bytes.len() {
+            return Err(Error::DecodeMessage(einval()));
+        }
 
         let (current_extension_bytes, next_extension_bytes) =
             remaining_bytes.split_at(extension_size);
@@ -1637,9 +1667,11 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
                 extensions.secctx = parse_security_context(nr_secctx, current_extension_bytes)?;
             }
             ExtType::SupGroups => {
-                // We're not exposing this feature to the guest, so we shouldn't get
-                // any messages including this extension.
-                unimplemented!("Support for supplemental groups is not implemented");
+                if !options.contains(FsOptions::CREATE_SUPP_GROUP) || sup_groups_received {
+                    return Err(Error::DecodeMessage(einval()));
+                }
+                sup_groups_received = true;
+                extensions.sup_gids = parse_sup_groups(current_extension_bytes)?;
             }
         }
 
@@ -1654,4 +1686,62 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUP_GROUPS_EXT_TYPE: u32 = 32;
+
+    fn build_sup_groups_request(groups: &[u32], extension_size: u32) -> (usize, Vec<u8>) {
+        let name = b"virtiofs-probe\0";
+        let mut request = name.to_vec();
+        let extension_header = ExtHeader {
+            size: extension_size,
+            ext_type: SUP_GROUPS_EXT_TYPE,
+        };
+        let group_header = SuppGroups {
+            nr_groups: groups.len() as u32,
+        };
+
+        request.extend_from_slice(extension_header.as_slice());
+        request.extend_from_slice(group_header.as_slice());
+        for group in groups {
+            request.extend_from_slice(&group.to_le_bytes());
+        }
+        while request.len() % 8 != name.len() % 8 {
+            request.push(0);
+        }
+        (name.len(), request)
+    }
+
+    #[test]
+    fn get_extensions_parses_supplementary_groups() {
+        let extension_size =
+            (size_of::<ExtHeader>() + size_of::<SuppGroups>() + 2 * size_of::<u32>())
+                .next_multiple_of(8) as u32;
+        let (skip, request) = build_sup_groups_request(&[1000, 2000], extension_size);
+
+        let extensions = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap();
+
+        assert_eq!(extensions.sup_gids, vec![1000, 2000]);
+    }
+
+    #[test]
+    fn get_extensions_rejects_truncated_supplementary_groups() {
+        let extension_size =
+            (size_of::<ExtHeader>() + size_of::<SuppGroups>() + 2 * size_of::<u32>())
+                .next_multiple_of(8) as u32;
+        let (skip, request) = build_sup_groups_request(&[1000], extension_size);
+
+        let err = get_extensions(FsOptions::CREATE_SUPP_GROUP, skip, &request).unwrap_err();
+
+        match err {
+            Error::DecodeMessage(io_err) => {
+                assert_eq!(io_err.raw_os_error(), Some(libc::EINVAL))
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }
