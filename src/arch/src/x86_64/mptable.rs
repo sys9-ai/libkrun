@@ -11,6 +11,7 @@ use std::slice;
 
 use libc::c_char;
 
+use super::layout::IRQ_MAX;
 use arch_gen::x86::mpspec;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
@@ -119,7 +120,7 @@ fn compute_mp_size(num_cpus: u8) -> usize {
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
         + mem::size_of::<MpcBusWrapper>()
-        + mem::size_of::<MpcIntsrcWrapper>() * 16
+        + mem::size_of::<MpcIntsrcWrapper>() * (IRQ_MAX as usize + 1)
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
@@ -215,7 +216,7 @@ pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
     // Per kvm_setup_default_irq_routing() in kernel
-    for i in 0..16 {
+    for i in 0..=IRQ_MAX as u8 {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
@@ -311,6 +312,29 @@ mod tests {
         .unwrap();
 
         setup_mptable(&mem, num_cpus).unwrap();
+    }
+
+    #[test]
+    fn mptable_describes_all_ioapic_pins() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(MPTABLE_START), 4096)]).unwrap();
+        setup_mptable(&mem, 1).unwrap();
+        let mpf: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
+        let base = GuestAddress(u64::from(mpf.0.physptr));
+        let table: MpcTableWrapper = mem.read_obj(base).unwrap();
+        let end = base.checked_add(u64::from(table.0.length)).unwrap();
+        let mut offset = base
+            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
+            .unwrap();
+        let mut pins = Vec::new();
+        while offset < end {
+            let kind: u8 = mem.read_obj(offset).unwrap();
+            if u32::from(kind) == mpspec::MP_INTSRC {
+                let entry: MpcIntsrcWrapper = mem.read_obj(offset).unwrap();
+                pins.push((entry.0.srcbusirq, entry.0.dstirq));
+            }
+            offset = offset.checked_add(table_entry_size(kind) as u64).unwrap();
+        }
+        assert_eq!(pins, (0..24).map(|pin| (pin, pin)).collect::<Vec<_>>());
     }
 
     #[test]
