@@ -208,6 +208,30 @@ mod tests {
     }
 
     #[test]
+    fn root_can_search_mode_zero_directory() {
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let mut st = stat_with_owner(1000, 1000, 0);
+        st.st_mode = libc::S_IFDIR;
+        check_stat_access(&ctx, &st, (libc::W_OK | libc::X_OK) as u32, &[]).unwrap();
+    }
+
+    #[test]
+    fn root_cannot_execute_file_without_execute_bits() {
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        let st = stat_with_owner(0, 0, 0o600);
+        let err = check_stat_access(&ctx, &st, libc::X_OK as u32, &[]).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
     fn supplementary_group_grants_directory_create_access() {
         let ctx = Context {
             uid: 1000,
@@ -660,7 +684,10 @@ fn check_stat_access(
     }
 
     if ctx.uid == 0 {
-        if mode & libc::X_OK != 0 && st.st_mode & 0o111 == 0 {
+        if mode & libc::X_OK != 0
+            && st.st_mode & libc::S_IFMT != libc::S_IFDIR
+            && st.st_mode & 0o111 == 0
+        {
             return Err(io::Error::from_raw_os_error(libc::EACCES));
         }
         return Ok(());
@@ -1662,7 +1689,9 @@ impl FileSystem for PassthroughFs {
         if inherits_group {
             create_mode |= libc::S_ISGID;
         }
-        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode) };
+        // Guest permissions are stored separately. The rootless server must
+        // retain access even for an overlayfs work directory created mode 000.
+        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode | 0o700) };
         if res == 0 {
             let entry = self.do_lookup(parent, name)?;
             self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(create_mode))?;
@@ -1782,7 +1811,7 @@ impl FileSystem for PassthroughFs {
                 data.file.as_raw_fd(),
                 name.as_ptr(),
                 flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                mode & !(umask & 0o777),
+                (mode & !(umask & 0o777)) | 0o600,
             )
         };
         if fd < 0 {
@@ -1793,7 +1822,7 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.do_lookup(parent, name)?;
-        self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, None)?;
+        self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(mode & !(umask & 0o777)))?;
         let entry = self.refresh_entry_attr(entry)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -1995,7 +2024,14 @@ impl FileSystem for PassthroughFs {
             let st = stat(&inode_data.file, self.my_uid, self.my_gid)?;
             let mode = clear_suid_sgid(st.st_mode);
             let mode = if mode != st.st_mode { Some(mode) } else { None };
-            set_override_xattr(inode_fd, Some((uid, gid)), mode)?;
+            // A no-op chown of a native whiteout must not attempt user.*
+            // xattrs, which Linux does not permit on character devices.
+            if (uid != u32::MAX && uid != st.st_uid)
+                || (gid != u32::MAX && gid != st.st_gid)
+                || mode.is_some()
+            {
+                set_override_xattr(inode_fd, Some((uid, gid)), mode)?;
+            }
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -2122,11 +2158,17 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
 
         // Safe because this doesn't modify any memory and we check the return value.
+        let guest_mode = mode & !umask;
+        let host_mode = if mode & libc::S_IFMT == libc::S_IFREG {
+            guest_mode | 0o600
+        } else {
+            guest_mode
+        };
         let res = unsafe {
             libc::mknodat(
                 data.file.as_raw_fd(),
                 name.as_ptr(),
-                (mode & !umask) as libc::mode_t,
+                host_mode as libc::mode_t,
                 u64::from(rdev),
             )
         };
@@ -2135,7 +2177,13 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             let entry = self.do_lookup(parent, name)?;
-            self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, None)?;
+            // Linux permits unprivileged whiteout creation, but user.* xattrs
+            // are forbidden on device inodes. Root-owned overlay whiteouts
+            // already have the correct guest type, owner and mode.
+            if mode == libc::S_IFCHR && rdev == 0 && ctx.uid == 0 && guest_gid == 0 {
+                return Ok(entry);
+            }
+            self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(guest_mode))?;
             self.refresh_entry_attr(entry)
         }
     }
@@ -2777,7 +2825,9 @@ impl FileSystem for PassthroughFs {
                 std::fs::remove_dir_all(&self.cfg.root_dir)?;
                 Ok(Vec::new())
             }
-            _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+            // Unknown ioctls use ENOTTY. OverlayFS treats this as absence of
+            // optional file-attribute support; EOPNOTSUPP aborts copy-up.
+            _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
         }
     }
 }
