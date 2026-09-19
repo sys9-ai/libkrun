@@ -33,6 +33,7 @@ const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
 const XATTR_KEY: &[u8] = b"user.containers.override_stat\0";
+const SPECIAL_XATTR_KEY: &[u8] = b"system.containers.override_stat\0";
 const GUEST_XATTR_PREFIX: &[u8] = b"user.containers.guest_xattr.";
 const UID_MAX: u32 = u32::MAX - 1;
 
@@ -205,6 +206,70 @@ mod tests {
         assert!(!should_store_override_stat_for_setattr_error(
             &io::Error::from_raw_os_error(libc::EIO)
         ));
+    }
+
+    #[test]
+    fn create_existing_file_preserves_owner_and_mode() {
+        let dir = unique_tmp_dir("create-existing");
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let (first, _, _) = fs
+            .create(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                fuse::ROOT_ID,
+                c"file",
+                0o600,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let (existing, _, _) = fs
+            .create(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                fuse::ROOT_ID,
+                c"file",
+                0o666,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(first.inode, existing.inode);
+        assert_eq!(existing.attr.st_mode & 0o777, 0o600);
+        let exclusive = fs
+            .create(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                fuse::ROOT_ID,
+                c"file",
+                0o666,
+                false,
+                (libc::O_RDWR | libc::O_EXCL) as u32,
+                0,
+                Extensions::default(),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(exclusive.raw_os_error(), Some(libc::EEXIST));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -453,16 +518,26 @@ fn get_xattr_common(buf: &[u8]) -> (Option<u32>, Option<u32>, Option<u32>) {
     (uid, gid, mode)
 }
 
-fn get_override_xattr(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
-    if host_fd_is_symlink(fd)? {
-        return Ok((None, None, None));
+// Linux rejects user.* on native sockets, FIFOs and devices before FUSE sees
+// the request. JuiceFS supports this owner-protected system namespace; keeping
+// the metadata on the inode preserves hardlinks, rename and Snap semantics.
+fn override_xattr_key(fd: RawFd) -> io::Result<Option<&'static [u8]>> {
+    match host_stat_fd(fd)?.st_mode & libc::S_IFMT {
+        libc::S_IFLNK => Ok(None),
+        libc::S_IFREG | libc::S_IFDIR => Ok(Some(XATTR_KEY)),
+        _ => Ok(Some(SPECIAL_XATTR_KEY)),
     }
+}
 
+fn get_override_xattr(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option<u32>)> {
+    let Some(key) = override_xattr_key(fd)? else {
+        return Ok((None, None, None));
+    };
     let mut buf = vec![0; 32];
     let res = unsafe {
         libc::fgetxattr(
             fd,
-            XATTR_KEY.as_ptr() as *const libc::c_char,
+            key.as_ptr() as *const libc::c_char,
             buf.as_mut_ptr() as *mut libc::c_void,
             buf.len(),
         )
@@ -472,7 +547,7 @@ fn get_override_xattr(fd: RawFd) -> io::Result<(Option<u32>, Option<u32>, Option
         unsafe {
             libc::getxattr(
                 path.as_ptr(),
-                XATTR_KEY.as_ptr() as *const libc::c_char,
+                key.as_ptr() as *const libc::c_char,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
             )
@@ -497,14 +572,13 @@ fn is_missing_override_xattr_error(err: &io::Error) -> bool {
 }
 
 fn has_override_xattr(fd: RawFd) -> io::Result<bool> {
-    if host_fd_is_symlink(fd)? {
+    let Some(key) = override_xattr_key(fd)? else {
         return Ok(false);
-    }
-
+    };
     let res = unsafe {
         libc::fgetxattr(
             fd,
-            XATTR_KEY.as_ptr() as *const libc::c_char,
+            key.as_ptr() as *const libc::c_char,
             std::ptr::null_mut(),
             0,
         )
@@ -522,7 +596,7 @@ fn has_override_xattr(fd: RawFd) -> io::Result<bool> {
     let res = unsafe {
         libc::getxattr(
             path.as_ptr(),
-            XATTR_KEY.as_ptr() as *const libc::c_char,
+            key.as_ptr() as *const libc::c_char,
             std::ptr::null_mut(),
             0,
         )
@@ -556,10 +630,9 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
 }
 
 fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
-    if host_fd_is_symlink(fd)? {
+    let Some(key) = override_xattr_key(fd)? else {
         return Ok(());
-    }
-
+    };
     let buf = if is_valid_owner(owner) && mode.is_some() {
         let owner = owner.unwrap();
         let mode = mode.unwrap();
@@ -599,7 +672,7 @@ fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -
     let res = unsafe {
         libc::fsetxattr(
             fd,
-            XATTR_KEY.as_ptr() as *const libc::c_char,
+            key.as_ptr() as *const libc::c_char,
             buf.as_ptr() as *const libc::c_void,
             buf.len(),
             0,
@@ -610,7 +683,7 @@ fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -
         unsafe {
             libc::setxattr(
                 path.as_ptr(),
-                XATTR_KEY.as_ptr() as *const libc::c_char,
+                key.as_ptr() as *const libc::c_char,
                 buf.as_ptr() as *const libc::c_void,
                 buf.len(),
                 0,
@@ -1878,14 +1951,29 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value. We don't
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems.
-        let fd = unsafe {
+        let mut fd = unsafe {
             libc::openat(
                 data.file.as_raw_fd(),
                 name.as_ptr(),
-                flags as i32 | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                flags as i32 | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 (mode & !(umask & 0o777)) | 0o600,
             )
         };
+        let created = fd >= 0;
+        if !created
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+            && flags as i32 & libc::O_EXCL == 0
+        {
+            // A stale negative lookup or concurrent host create can reach here.
+            // Opening an existing inode must not reset its owner or permissions.
+            fd = unsafe {
+                libc::openat(
+                    data.file.as_raw_fd(),
+                    name.as_ptr(),
+                    (flags as i32 & !libc::O_CREAT) | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+        }
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1894,12 +1982,14 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.do_lookup(parent, name)?;
-        self.set_guest_metadata(
-            entry.inode,
-            ctx.uid,
-            guest_gid,
-            Some(mode & !(umask & 0o777)),
-        )?;
+        if created {
+            self.set_guest_metadata(
+                entry.inode,
+                ctx.uid,
+                guest_gid,
+                Some(mode & !(umask & 0o777)),
+            )?;
+        }
         let entry = self.refresh_entry_attr(entry)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -2254,10 +2344,8 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             let entry = self.do_lookup(parent, name)?;
-            // Linux forbids user.* xattrs on special inodes. Native root-owned
-            // sockets, FIFOs and devices already have the requested guest
-            // metadata (the server's identity maps to guest root). This also
-            // covers OverlayFS whiteouts and Podman's conmon attach socket.
+            // Native root-owned special inodes need no ownership override.
+            // Non-root owners use the filesystem's system namespace instead.
             if mode & libc::S_IFMT != libc::S_IFREG
                 && entry.attr.st_uid == ctx.uid
                 && entry.attr.st_gid == guest_gid
