@@ -208,6 +208,80 @@ mod tests {
     }
 
     #[test]
+    fn root_can_create_socket_and_fifo_without_override_xattrs() {
+        let dir = unique_tmp_dir("native-special-inodes");
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let socket = fs
+            .mknod(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                fuse::ROOT_ID,
+                c"socket",
+                libc::S_IFSOCK | 0o600,
+                0,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(socket.attr.st_mode, libc::S_IFSOCK | 0o600);
+        assert_eq!(socket.attr.st_uid, 0);
+        assert_eq!(socket.attr.st_gid, 0);
+        let absent = fs
+            .getxattr(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                socket.inode,
+                c"security.capability",
+                0,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(absent.raw_os_error(), Some(libc::ENODATA));
+        let attrs = fs
+            .listxattr(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                socket.inode,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(attrs, ListxattrReply::Count(0)));
+        let fifo = fs
+            .mknod(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 1,
+                },
+                fuse::ROOT_ID,
+                c"fifo",
+                libc::S_IFIFO | 0o600,
+                0,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(fifo.attr.st_mode, libc::S_IFIFO | 0o600);
+        assert_eq!(fifo.attr.st_uid, 0);
+        assert_eq!(fifo.attr.st_gid, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn root_can_search_mode_zero_directory() {
         let ctx = Context {
             uid: 0,
@@ -926,8 +1000,8 @@ pub struct PassthroughFs {
     cfg: Config,
 }
 
-/// Some operations can only be performed on opened FDs without O_PATH, or on symlink paths.
-/// This enum encodes a fallback to handle those symlinks separately.
+/// Non-symlink metadata uses a pinned O_PATH inode via procfs. Symlink metadata
+/// keeps the no-follow xattr path; it must never address the symlink's target.
 enum FileOrLink {
     File(File),
     Link(CString),
@@ -937,15 +1011,17 @@ fn list_xattr_raw(
     target: &FileOrLink,
     buf: *mut libc::c_char,
     size: libc::size_t,
-) -> libc::ssize_t {
-    match target {
-        FileOrLink::File(file) => unsafe { libc::flistxattr(file.as_raw_fd(), buf, size) },
+) -> io::Result<libc::ssize_t> {
+    Ok(match target {
+        FileOrLink::File(file) => unsafe {
+            libc::listxattr(proc_fd_path(file.as_raw_fd())?.as_ptr(), buf, size)
+        },
         FileOrLink::Link(link) => unsafe { libc::llistxattr(link.as_ptr(), buf, size) },
-    }
+    })
 }
 
 fn list_host_xattrs(target: &FileOrLink) -> io::Result<Vec<u8>> {
-    let res = list_xattr_raw(target, std::ptr::null_mut(), 0);
+    let res = list_xattr_raw(target, std::ptr::null_mut(), 0)?;
     if res < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -954,7 +1030,7 @@ fn list_host_xattrs(target: &FileOrLink) -> io::Result<Vec<u8>> {
     }
 
     let mut buf = vec![0; res as usize];
-    let res = list_xattr_raw(target, buf.as_mut_ptr() as *mut libc::c_char, buf.len());
+    let res = list_xattr_raw(target, buf.as_mut_ptr() as *mut libc::c_char, buf.len())?;
     if res < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1078,26 +1154,21 @@ impl PassthroughFs {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn open_inode_or_path(&self, inode: Inode, flags: i32) -> io::Result<FileOrLink> {
-        match self.open_inode(inode, flags) {
-            Ok(a) => Ok(FileOrLink::File(a)),
-            Err(e) => {
-                if e.raw_os_error() == Some(libc::ELOOP) {
-                    let data = self
-                        .inodes
-                        .read()
-                        .unwrap()
-                        .get(&inode)
-                        .cloned()
-                        .ok_or_else(ebadf)?;
-
-                    let pathname = CString::new(format!("/proc/self/fd/{}", data.file.as_raw_fd()))
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    Ok(FileOrLink::Link(pathname))
-                } else {
-                    Err(e)
-                }
-            }
+    // Xattrs are inode metadata, not device I/O. Keep an O_PATH descriptor
+    // pinned and access it through procfs; opening a whiteout fails with EACCES,
+    // opening a socket fails with ENXIO, and opening a device may have side effects.
+    fn xattr_target(&self, inode: Inode) -> io::Result<FileOrLink> {
+        let data = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .ok_or_else(ebadf)?;
+        if host_fd_is_symlink(data.file.as_raw_fd())? {
+            Ok(FileOrLink::Link(proc_fd_path(data.file.as_raw_fd())?))
+        } else {
+            Ok(FileOrLink::File(data.file.try_clone()?))
         }
     }
 
@@ -1691,7 +1762,8 @@ impl FileSystem for PassthroughFs {
         }
         // Guest permissions are stored separately. The rootless server must
         // retain access even for an overlayfs work directory created mode 000.
-        let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode | 0o700) };
+        let res =
+            unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode | 0o700) };
         if res == 0 {
             let entry = self.do_lookup(parent, name)?;
             self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(create_mode))?;
@@ -1822,7 +1894,12 @@ impl FileSystem for PassthroughFs {
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
         let entry = self.do_lookup(parent, name)?;
-        self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(mode & !(umask & 0o777)))?;
+        self.set_guest_metadata(
+            entry.inode,
+            ctx.uid,
+            guest_gid,
+            Some(mode & !(umask & 0o777)),
+        )?;
         let entry = self.refresh_entry_attr(entry)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -2177,10 +2254,14 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::last_os_error())
         } else {
             let entry = self.do_lookup(parent, name)?;
-            // Linux permits unprivileged whiteout creation, but user.* xattrs
-            // are forbidden on device inodes. Root-owned overlay whiteouts
-            // already have the correct guest type, owner and mode.
-            if mode == libc::S_IFCHR && rdev == 0 && ctx.uid == 0 && guest_gid == 0 {
+            // Linux forbids user.* xattrs on special inodes. Native root-owned
+            // sockets, FIFOs and devices already have the requested guest
+            // metadata (the server's identity maps to guest root). This also
+            // covers OverlayFS whiteouts and Podman's conmon attach socket.
+            if mode & libc::S_IFMT != libc::S_IFREG
+                && entry.attr.st_uid == ctx.uid
+                && entry.attr.st_gid == guest_gid
+            {
                 return Ok(entry);
             }
             self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(guest_mode))?;
@@ -2383,15 +2464,12 @@ impl FileSystem for PassthroughFs {
 
         let host_name = host_xattr_name_for_guest(name)?;
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
-        // functions in that case.
-        let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
+        let res = match self.xattr_target(inode)? {
             FileOrLink::File(file) => {
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe {
-                    libc::fsetxattr(
-                        file.as_raw_fd(),
+                    libc::setxattr(
+                        proc_fd_path(file.as_raw_fd())?.as_ptr(),
                         host_name.as_ptr(),
                         value.as_ptr() as *const libc::c_void,
                         value.len(),
@@ -2438,15 +2516,12 @@ impl FileSystem for PassthroughFs {
         let host_name = host_xattr_name_for_guest(name)?;
         let mut buf = vec![0; size as usize];
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
-        // functions in that case.
-        let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
+        let res = match self.xattr_target(inode)? {
             FileOrLink::File(file) => {
                 // Safe because this will only modify the contents of `buf`.
                 unsafe {
-                    libc::fgetxattr(
-                        file.as_raw_fd(),
+                    libc::getxattr(
+                        proc_fd_path(file.as_raw_fd())?.as_ptr(),
                         host_name.as_ptr(),
                         buf.as_mut_ptr() as *mut libc::c_void,
                         size as libc::size_t,
@@ -2483,10 +2558,7 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
-        // functions in that case.
-        let target = self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)?;
+        let target = self.xattr_target(inode)?;
         let buf = guest_xattr_list_from_host(&list_host_xattrs(&target)?);
 
         if size == 0 {
@@ -2505,13 +2577,12 @@ impl FileSystem for PassthroughFs {
 
         let host_name = host_xattr_name_for_guest(name)?;
 
-        // The f{set,get,remove,list}xattr functions don't work on an fd opened with `O_PATH` so we
-        // need to get a new fd. This doesn't work for symlinks, so we use the l* family of
-        // functions in that case.
-        let res = match self.open_inode_or_path(inode, libc::O_RDONLY | libc::O_NONBLOCK)? {
+        let res = match self.xattr_target(inode)? {
             FileOrLink::File(file) => {
                 // Safe because this doesn't modify any memory and we check the return value.
-                unsafe { libc::fremovexattr(file.as_raw_fd(), host_name.as_ptr()) }
+                unsafe {
+                    libc::removexattr(proc_fd_path(file.as_raw_fd())?.as_ptr(), host_name.as_ptr())
+                }
             }
             FileOrLink::Link(link) => {
                 // Safe because this doesn't modify any memory and we check the return value.
