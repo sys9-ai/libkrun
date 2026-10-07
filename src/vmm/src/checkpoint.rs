@@ -164,7 +164,7 @@ use vm_memory::{
     GuestRegionMmap, MemoryRegionAddress, MmapRegion,
 };
 
-const FORMAT: &str = "run9-libkrun-checkpoint-1";
+const FORMAT: &str = "run9-libkrun-checkpoint-2";
 const MAX_STATE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -215,12 +215,8 @@ pub fn read_checkpoint(directory: &Path) -> io::Result<Checkpoint> {
     let mut data = Vec::new();
     file.take(MAX_STATE_BYTES as u64 + 1)
         .read_to_end(&mut data)?;
-    let (state, consumed): (Checkpoint, usize) = bincode::serde::decode_from_slice(
-        &data,
-        bincode::config::standard().with_limit::<MAX_STATE_BYTES>(),
-    )
-    .map_err(io::Error::other)?;
-    if consumed != data.len() || state.format != FORMAT || state.host_profile != host_profile() {
+    let state: Checkpoint = devices::checkpoint::decode::<_, MAX_STATE_BYTES>(&data)?;
+    if state.format != FORMAT || state.host_profile != host_profile() {
         return Err(io::Error::other(
             "checkpoint format or host CPU is incompatible",
         ));
@@ -306,6 +302,7 @@ impl Vmm {
             return Err(io::Error::other("checkpoint requires a quiesced VM"));
         }
         std::fs::DirBuilder::new().mode(0o700).create(directory)?;
+        File::open(directory.parent().unwrap_or(Path::new(".")))?.sync_all()?;
         let mut devices = Vec::new();
         for (kind, id, address) in self.mmio_device_manager.checkpoint_devices() {
             let payload_dir = directory.join(format!("device-{address:x}"));
@@ -327,6 +324,9 @@ impl Vmm {
                 address,
                 state: transport.capture_state(&payload_dir)?,
             });
+            // Syncing the checkpoint root cannot persist filenames in its
+            // child directories, including deleted-open inode sidecars.
+            File::open(&payload_dir)?.sync_all()?;
         }
         let mut memory = OpenOptions::new()
             .write(true)
@@ -348,10 +348,25 @@ impl Vmm {
                 region
                     .read_slice(&mut buffer[..length], MemoryRegionAddress(position))
                     .map_err(|e| io::Error::other(format!("checkpoint RAM read: {e}")))?;
-                if buffer[..length].iter().all(|byte| *byte == 0) {
-                    memory.seek(SeekFrom::Current(length as i64))?;
-                } else {
-                    memory.write_all(&buffer[..length])?;
+                // Keep holes at guest-page granularity, coalescing adjacent
+                // runs so dense RAM still takes one write per read buffer.
+                let mut start = 0;
+                while start < length {
+                    let mut end = (start + 4096).min(length);
+                    let zero = buffer[start..end].iter().all(|byte| *byte == 0);
+                    while end < length {
+                        let next = (end + 4096).min(length);
+                        if buffer[end..next].iter().all(|byte| *byte == 0) != zero {
+                            break;
+                        }
+                        end = next;
+                    }
+                    if zero {
+                        memory.seek(SeekFrom::Current((end - start) as i64))?;
+                    } else {
+                        memory.write_all(&buffer[start..end])?;
+                    }
+                    start = end;
                 }
                 position += length as u64;
             }
@@ -367,11 +382,7 @@ impl Vmm {
             execution: self.capture_execution_state()?,
             devices,
         };
-        let encoded = bincode::serde::encode_to_vec(state, bincode::config::standard())
-            .map_err(io::Error::other)?;
-        if encoded.len() > MAX_STATE_BYTES {
-            return Err(io::Error::other("checkpoint state exceeds size limit"));
-        }
+        let encoded = devices::checkpoint::encode::<_, MAX_STATE_BYTES>(&state)?;
         // state.bin is the completion marker. Partial writes never become a valid generation.
         let mut file = OpenOptions::new()
             .write(true)
@@ -569,5 +580,83 @@ impl Subscriber for CheckpointEndpoint {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
             Err(error) => error!("checkpoint accept failed: {error}"),
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "tee")))]
+mod tests {
+    use super::*;
+    use crate::device_manager::{legacy::PortIODeviceManager, mmio::MMIODeviceManager};
+    use crate::vstate::{KvmContext, Vm};
+    use devices::legacy::{Cmos, KvmIoapic};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::AtomicI32;
+    use utils::eventfd::{EventFd, EFD_NONBLOCK};
+
+    #[test]
+    fn memory_checkpoint_capture_keeps_zero_pages_sparse() {
+        const MIB: usize = 1024 * 1024;
+        let mut expected = vec![0u8; 8 * MIB];
+        for index in 0..8 {
+            let start = index * MIB + 4096;
+            expected[start..start + 4096].fill(index as u8 + 1);
+        }
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), expected.len())]).unwrap();
+        memory.write_slice(&expected, GuestAddress(0)).unwrap();
+
+        // No guest execution is needed to exercise the real capture/publication
+        // path, but its VM-state capture requires KVM's irqchip and PIT.
+        let kvm = KvmContext::new().unwrap();
+        let mut vm = Vm::new(kvm.fd()).unwrap();
+        KvmIoapic::new(vm.fd()).unwrap();
+        vm.memory_init(&memory, kvm.max_memslots()).unwrap();
+        let exit_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let pio_device_manager = PortIODeviceManager::new(
+            Arc::new(Mutex::new(Cmos::new(expected.len() as u64, 0))),
+            Vec::new(),
+            exit_evt.try_clone().unwrap(),
+        )
+        .unwrap();
+        let mut mmio_base = arch::MMIO_MEM_START;
+        let mut vmm = Vmm {
+            guest_memory: memory,
+            arch_memory_info: Default::default(),
+            kernel_cmdline: kernel::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE),
+            vcpus_handles: Vec::new(),
+            checkpoint_control: Default::default(),
+            exit_evt,
+            vm,
+            exit_observers: Vec::new(),
+            exit_code: Arc::new(AtomicI32::new(0)),
+            mmio_device_manager: MMIODeviceManager::new(
+                &mut mmio_base,
+                (arch::IRQ_BASE, arch::IRQ_MAX),
+            ),
+            pio_device_manager,
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "krun-sparse-checkpoint-{}-{unique}",
+            std::process::id()
+        ));
+
+        vmm.quiesce().unwrap();
+        vmm.capture_checkpoint(&directory).unwrap();
+        let memory_path = directory.join("memory.bin");
+        let saved = std::fs::read(&memory_path).unwrap();
+        let metadata = std::fs::metadata(&memory_path).unwrap();
+        read_checkpoint(&directory).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(saved, expected, "sparse capture changed guest RAM");
+        assert_eq!(metadata.len(), (8 * MIB) as u64);
+        assert!(
+            metadata.blocks() * 512 <= 64 * 1024,
+            "32 KiB of populated pages allocated {} bytes in the checkpoint",
+            metadata.blocks() * 512
+        );
     }
 }

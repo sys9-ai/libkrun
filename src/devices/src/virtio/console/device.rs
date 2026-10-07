@@ -24,6 +24,7 @@ use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 
 pub(crate) const CONTROL_RXQ_INDEX: usize = 2;
 pub(crate) const CONTROL_TXQ_INDEX: usize = 3;
+const CHECKPOINT_STATE_LIMIT: usize = 1024 * 1024;
 
 pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_CONSOLE_F_SIZE as u64)
     | (1 << uapi::VIRTIO_CONSOLE_F_MULTIPORT as u64)
@@ -312,15 +313,11 @@ impl VirtioDevice for Console {
                     .ok_or_else(|| std::io::Error::other("console port is not quiesced"))
             })
             .collect::<std::io::Result<_>>()?;
-        let payload = bincode::serde::encode_to_vec(
-            (
-                &self.paused_ports,
-                self.control.capture_state(),
-                self.config.as_slice(),
-            ),
-            bincode::config::standard(),
-        )
-        .map_err(std::io::Error::other)?;
+        let payload = crate::checkpoint::encode::<_, CHECKPOINT_STATE_LIMIT>(&(
+            &self.paused_ports,
+            self.control.capture_state(),
+            self.config.as_slice(),
+        ))?;
         Ok(crate::virtio::DeviceSnapshot { queues, payload })
     }
 
@@ -329,16 +326,9 @@ impl VirtioDevice for Console {
         payload: &[u8],
         _directory: &std::path::Path,
     ) -> std::io::Result<()> {
-        let ((ports, messages, config), consumed): ((Vec<usize>, Vec<Vec<u8>>, Vec<u8>), usize) =
-            bincode::serde::decode_from_slice(
-                payload,
-                bincode::config::standard().with_limit::<1048576>(),
-            )
-            .map_err(std::io::Error::other)?;
-        if consumed != payload.len()
-            || config != self.config.as_slice()
-            || ports.iter().any(|id| *id >= self.ports.len())
-        {
+        let (ports, messages, config): (Vec<usize>, Vec<Vec<u8>>, Vec<u8>) =
+            crate::checkpoint::decode::<_, CHECKPOINT_STATE_LIMIT>(payload)?;
+        if config != self.config.as_slice() || ports.iter().any(|id| *id >= self.ports.len()) {
             return Err(std::io::Error::other(
                 "invalid console checkpoint configuration",
             ));

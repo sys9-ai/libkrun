@@ -4,6 +4,7 @@ use std::os::fd::RawFd;
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum ConnectError {
+    CreateEventFd(io::Error),
     InvalidAddress(nix::Error),
     CreateSocket(nix::Error),
     Binding(nix::Error),

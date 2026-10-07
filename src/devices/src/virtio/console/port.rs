@@ -59,15 +59,18 @@ impl PortDescription {
     }
 }
 
+enum PortQueue {
+    Worker(JoinHandle<Queue>),
+    Idle(Queue),
+}
+
 enum PortState {
     Inactive,
     Active {
         stopfd: utils::eventfd::EventFd,
         stop: Arc<AtomicBool>,
-        rx_thread: Option<JoinHandle<Queue>>,
-        idle_rx: Option<Queue>,
-        tx_thread: Option<JoinHandle<Queue>>,
-        idle_tx: Option<Queue>,
+        rx: PortQueue,
+        tx: PortQueue,
     },
 }
 
@@ -105,7 +108,7 @@ impl Port {
 
     pub fn notify_rx(&self) {
         if let PortState::Active {
-            rx_thread: Some(handle),
+            rx: PortQueue::Worker(handle),
             ..
         } = &self.state
         {
@@ -115,7 +118,7 @@ impl Port {
 
     pub fn notify_tx(&self) {
         if let PortState::Active {
-            tx_thread: Some(handle),
+            tx: PortQueue::Worker(handle),
             ..
         } = &self.state
         {
@@ -142,38 +145,40 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
-        let mut idle_rx = Some(rx_queue);
-        let mut idle_tx = Some(tx_queue);
-        let rx_thread = input.map(|input| {
-            let rx_queue = idle_rx.take().unwrap();
+        let rx = if let Some(input) = input {
             let mem = mem.clone();
             let interrupt = interrupt.clone();
             let port_id = self.port_id;
             let stopfd = stopfd.try_clone().unwrap();
             let stop = stop.clone();
-            thread::Builder::new()
-                .name("console port".into())
-                .spawn(move || {
-                    process_rx(
-                        mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
-                    )
-                })
-                .unwrap()
-        });
+            PortQueue::Worker(
+                thread::Builder::new()
+                    .name("console port".into())
+                    .spawn(move || {
+                        process_rx(
+                            mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
+                        )
+                    })
+                    .unwrap(),
+            )
+        } else {
+            PortQueue::Idle(rx_queue)
+        };
 
-        let tx_thread = output.map(|output| {
-            let tx_queue = idle_tx.take().unwrap();
+        let tx = if let Some(output) = output {
             let stop = stop.clone();
-            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
-        });
+            PortQueue::Worker(thread::spawn(move || {
+                process_tx(mem, tx_queue, interrupt, output, stop)
+            }))
+        } else {
+            PortQueue::Idle(tx_queue)
+        };
 
         self.state = PortState::Active {
             stopfd,
             stop,
-            rx_thread,
-            tx_thread,
-            idle_rx,
-            idle_tx,
+            rx,
+            tx,
         }
     }
 
@@ -182,33 +187,31 @@ impl Port {
         let PortState::Active {
             stopfd,
             stop,
-            rx_thread,
-            tx_thread,
-            idle_rx,
-            idle_tx,
+            rx,
+            tx,
         } = state
         else {
             return Ok(None);
         };
         stop.store(true, Ordering::Release);
         stopfd.write(1)?;
-        if let Some(thread) = &rx_thread {
+        if let PortQueue::Worker(thread) = &rx {
             thread.thread().unpark();
         }
-        if let Some(thread) = &tx_thread {
+        if let PortQueue::Worker(thread) = &tx {
             thread.thread().unpark();
         }
-        let rx = match rx_thread {
-            Some(thread) => thread
+        let rx = match rx {
+            PortQueue::Worker(thread) => thread
                 .join()
                 .map_err(|_| std::io::Error::other("console input worker panicked"))?,
-            None => idle_rx.ok_or_else(|| std::io::Error::other("console input queue missing"))?,
+            PortQueue::Idle(queue) => queue,
         };
-        let tx = match tx_thread {
-            Some(thread) => thread
+        let tx = match tx {
+            PortQueue::Worker(thread) => thread
                 .join()
                 .map_err(|_| std::io::Error::other("console output worker panicked"))?,
-            None => idle_tx.ok_or_else(|| std::io::Error::other("console output queue missing"))?,
+            PortQueue::Idle(queue) => queue,
         };
         Ok(Some((rx, tx)))
     }

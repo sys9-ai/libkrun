@@ -439,6 +439,18 @@ impl Display for Error {
 
 pub type Result<T> = result::Result<T, Error>;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn validate_checkpoint_xsave_size(size: i32) -> Result<()> {
+    // Zero means this kernel predates XSAVE2 and uses the fixed-size ABI.
+    // SET_XSAVE otherwise reads the VM's entire buffer, including its FAM.
+    if size < 0 || size > std::mem::size_of::<kvm_xsave>() as i32 {
+        return Err(Error::StateCodec(format!(
+            "unsupported checkpoint XSAVE size: {size}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "tee")]
 #[derive(Debug)]
 pub struct MeasuredRegion {
@@ -955,6 +967,8 @@ pub struct Vcpu {
     #[cfg(target_arch = "x86_64")]
     msr_list: MsrList,
     #[cfg(target_arch = "x86_64")]
+    checkpoint_xsave_size: i32,
+    #[cfg(target_arch = "x86_64")]
     kernel_enomem_workaround: bool,
 
     #[cfg(target_arch = "aarch64")]
@@ -1096,6 +1110,7 @@ impl Vcpu {
             io_bus,
             cpuid,
             msr_list,
+            checkpoint_xsave_size: vm_fd.check_extension_int(kvm_ioctls::Cap::Xsave2),
             kernel_enomem_workaround,
             event_receiver,
             event_sender: Some(event_sender),
@@ -1327,6 +1342,7 @@ impl Vcpu {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     fn save_state(&self) -> Result<VcpuState> {
+        validate_checkpoint_xsave_size(self.checkpoint_xsave_size)?;
         /*
          * Ordering requirements:
          *
@@ -1432,6 +1448,7 @@ impl Vcpu {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     fn restore_state(&mut self, state: VcpuState) -> Result<()> {
+        validate_checkpoint_xsave_size(self.checkpoint_xsave_size)?;
         /*
          * Ordering requirements:
          *
@@ -2122,6 +2139,135 @@ mod tests {
         }
 
         (vm, vcpu, gm)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn execution_state_captures_supported_xss() {
+        let kvm = KvmContext::new().unwrap();
+        let supported = kvm.fd().get_msr_index_list().unwrap();
+        if !supported.as_slice().contains(&MSR_IA32_XSS) {
+            eprintln!("SKIP: host KVM does not expose IA32_XSS");
+            return;
+        }
+
+        let (_vm, mut cpu, mem) = setup_vcpu(0x10000);
+        let config = VcpuConfig {
+            vcpu_count: 1,
+            ht_enabled: false,
+            cpu_template: None,
+            nested_enabled: false,
+        };
+        cpu.configure_x86_64(&mem, GuestAddress(0), &config, true)
+            .unwrap();
+        let supported_xss = cpu
+            .cpuid
+            .as_slice()
+            .iter()
+            .find(|entry| entry.function == 0xd && entry.index == 1)
+            .map(|entry| u64::from(entry.ecx) | (u64::from(entry.edx) << 32))
+            .unwrap_or(0);
+        let value = if supported_xss == 0 {
+            eprintln!(
+                "COVERAGE LIMIT: guest CPUID exposes no nonzero IA32_XSS components; testing inventory and zero state only"
+            );
+            0
+        } else {
+            1u64 << supported_xss.trailing_zeros()
+        };
+        let xss = Msrs::from_entries(&[kvm_msr_entry {
+            index: MSR_IA32_XSS,
+            data: value,
+            ..Default::default()
+        }])
+        .unwrap();
+        assert_eq!(cpu.fd.set_msrs(&xss).unwrap(), 1);
+
+        let payload = cpu.capture_execution_state().unwrap();
+        let (state, consumed): (VcpuState, usize) =
+            bincode::serde::decode_from_slice(&payload, bincode::config::standard()).unwrap();
+        assert_eq!(consumed, payload.len());
+        let saved_xss = state
+            .msrs
+            .iter()
+            .find(|entry| entry.index == MSR_IA32_XSS)
+            .expect("KVM exposes IA32_XSS, but execution capture omitted it");
+        assert_eq!(saved_xss.data, value);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn checkpoint_xsave_size_accepts_legacy_and_rejects_extensions() {
+        assert!(validate_checkpoint_xsave_size(0).is_ok());
+        assert!(validate_checkpoint_xsave_size(4096).is_ok());
+        assert!(validate_checkpoint_xsave_size(4097).is_err());
+        assert!(validate_checkpoint_xsave_size(-1).is_err());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn checkpoint_rejects_extended_xsave_before_capture() {
+        const CHILD_ENV: &str = "KRUN_TEST_EXTENDED_XSAVE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "linux::vstate::tests::checkpoint_rejects_extended_xsave_before_capture",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains("running 1 test"),
+                "the isolated hardware test did not run: {stdout}\n{stderr}"
+            );
+            eprint!("{stderr}");
+            return;
+        }
+
+        // Guest permission is process-wide. Keep it out of the parallel test
+        // runner so other KVM tests retain their ordinary CPU profile.
+        const ARCH_REQ_XCOMP_GUEST_PERM: libc::c_ulong = 0x1025;
+        const XFEATURE_XTILEDATA: libc::c_ulong = 18;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_arch_prctl,
+                ARCH_REQ_XCOMP_GUEST_PERM,
+                XFEATURE_XTILEDATA,
+            )
+        };
+        if result != 0 {
+            eprintln!(
+                "SKIP extended XSAVE hardware path: guest AMX permission unavailable: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        let (vm, mut cpu, memory) = setup_vcpu(0x10000);
+        let size = vm.fd().check_extension_int(kvm_ioctls::Cap::Xsave2);
+        if size <= std::mem::size_of::<kvm_xsave>() as i32 {
+            eprintln!("SKIP extended XSAVE hardware path: KVM reports {size} bytes");
+            return;
+        }
+        let config = VcpuConfig {
+            vcpu_count: 1,
+            ht_enabled: false,
+            cpu_template: None,
+            nested_enabled: false,
+        };
+        cpu.configure_x86_64(&memory, GuestAddress(0), &config, true)
+            .unwrap();
+        let error = cpu.capture_execution_state().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported checkpoint XSAVE size"),
+            "extended state must be rejected explicitly before fixed-size capture: {error}"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -151,6 +151,7 @@ static WHITELISTED_MSR_RANGES: &[MsrRange] = &[
     SINGLE_MSR!(MSR_IA32_TSCDEADLINE),
     MSR_RANGE!(APIC_BASE_MSR, APIC_MSR_INDEXES),
     SINGLE_MSR!(MSR_IA32_BNDCFGS),
+    SINGLE_MSR!(MSR_IA32_XSS),
     SINGLE_MSR!(MSR_KVM_WALL_CLOCK_NEW),
     SINGLE_MSR!(MSR_KVM_SYSTEM_TIME_NEW),
     SINGLE_MSR!(MSR_KVM_ASYNC_PF_EN),
@@ -258,6 +259,14 @@ pub fn supported_guest_msrs(kvm_fd: &Kvm) -> Result<MsrList> {
 mod tests {
     use super::*;
     use kvm_ioctls::Kvm;
+
+    #[test]
+    fn checkpoint_inventory_includes_xss() {
+        assert!(
+            msr_should_serialize(MSR_IA32_XSS),
+            "checkpoint MSR inventory must retain IA32_XSS when KVM exposes it"
+        );
+    }
 
     #[test]
     fn test_msr_whitelist() {

@@ -563,6 +563,21 @@ pub fn build_microvm(
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let checkpoint_enabled =
+        vm_resources.checkpoint_socket.is_some() || vm_resources.restore_path.is_some();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if checkpoint_enabled
+        && (vm_resources.nested_enabled
+            || vm_resources.split_irqchip
+            || cfg!(feature = "tee")
+            || !vm_resources.serial_consoles.is_empty()
+            || vm_resources.firmware_config.is_some())
+    {
+        return Err(StartMicrovmError::Internal(Error::Checkpoint(
+            io::Error::other("unsupported checkpoint machine profile"),
+        )));
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     let checkpoint = vm_resources
         .restore_path
         .as_ref()
@@ -632,6 +647,15 @@ pub fn build_microvm(
         )?;
         (kvm, vm)
     };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if checkpoint_enabled {
+        crate::vstate::validate_checkpoint_xsave_size(
+            vm.fd().check_extension_int(kvm_ioctls::Cap::Xsave2),
+        )
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    }
 
     #[cfg(feature = "tee")]
     let tee = vm_resources.tee_config().tee;
@@ -1535,14 +1559,6 @@ pub fn create_guest_memory(
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if let Some(directory) = &vm_resources.restore_path {
-        if vm_resources.split_irqchip
-            || cfg!(feature = "tee")
-            || vm_resources.firmware_config.is_some()
-        {
-            return Err(StartMicrovmError::Internal(Error::Checkpoint(
-                io::Error::other("unsupported checkpoint machine profile"),
-            )));
-        }
         if let Payload::KernelMmap = payload {
             let kernel = vm_resources
                 .kernel_bundle
@@ -2422,6 +2438,45 @@ fn attach_snd_device(vmm: &mut Vmm, intc: IrqChip) -> std::result::Result<(), St
 pub mod tests {
     use super::*;
     use crate::vmm_config::kernel_bundle::KernelBundle;
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn checkpoint_rejects_nested_virtualization_before_loading_payload() {
+        let mut resources = VmResources::default();
+        resources.nested_enabled = true;
+        resources.checkpoint_socket = Some("/unused/checkpoint.sock".into());
+        let mut events = EventManager::new().unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let error = match build_microvm(&resources, &mut events, None, sender) {
+            Ok(_) => panic!("nested checkpoint profile unexpectedly started"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("unsupported checkpoint machine profile"),
+            "checkpoint admission must reject nested virtualization before payload loading: {error}"
+        );
+
+        resources.checkpoint_socket = None;
+        resources.restore_path = Some("/unused/checkpoint".into());
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let error = match build_microvm(&resources, &mut events, None, sender) {
+            Ok(_) => panic!("nested restore profile unexpectedly started"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported checkpoint machine profile"),
+            "restore admission must reject nested virtualization before snapshot loading: {error}"
+        );
+
+        resources.restore_path = None;
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        assert!(matches!(
+            build_microvm(&resources, &mut events, None, sender),
+            Err(StartMicrovmError::MissingKernelConfig)
+        ));
+    }
 
     #[allow(unused)]
     fn default_guest_memory(

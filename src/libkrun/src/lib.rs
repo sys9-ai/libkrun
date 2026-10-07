@@ -2785,17 +2785,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if (ctx_cfg.vmr.checkpoint_socket.is_some() || ctx_cfg.vmr.restore_path.is_some())
-        && (ctx_cfg.vmr.split_irqchip
-            || cfg!(feature = "tee")
-            || !ctx_cfg.vmr.serial_consoles.is_empty()
-            || ctx_cfg.vmr.firmware_config.is_some())
-    {
-        error!("Checkpoint control does not support this machine profile");
-        return -libc::EINVAL;
-    }
-
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,

@@ -1055,6 +1055,7 @@ pub struct PassthroughFs {
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
     inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
+    restored_identities: RwLock<Option<checkpoint::RestoredInodeIdentities>>,
     next_inode: AtomicU64,
     init_inode: u64,
 
@@ -1168,6 +1169,7 @@ impl PassthroughFs {
 
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
+            restored_identities: RwLock::new(None),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 2),
             init_inode: fuse::ROOT_ID + 1,
 
@@ -1309,6 +1311,11 @@ impl PassthroughFs {
             // There is a possible race here where 2 threads end up adding the same file
             // into the inode list.  However, since each of those will get a unique Inode
             // value and unique file descriptors this shouldn't be that much of a problem.
+            if self.cfg.checkpoint_enabled {
+                if let Some(identities) = self.restored_identities.write().unwrap().as_mut() {
+                    attr.st_ino = identities.number(altkey)?;
+                }
+            }
             let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
             self.inodes.write().unwrap().insert(
                 inode,
@@ -1319,7 +1326,7 @@ impl PassthroughFs {
                 },
                 Arc::new(InodeData {
                     inode,
-                    guest_ino: st.st_ino,
+                    guest_ino: attr.st_ino,
                     file: f,
                     dev: st.st_dev,
                     mnt_id,
@@ -1464,9 +1471,37 @@ impl PassthroughFs {
         if start > entries.len() {
             return Err(einval());
         }
+        let restored = self.restored_identities.read().unwrap().is_some();
         for (index, entry) in entries.iter().enumerate().skip(start) {
+            let mut guest_ino = entry.inode;
+            if restored {
+                // Cached cookies preserve enumeration order, but entries not
+                // LOOKUPed at capture have no saved inode mapping. Resolve every
+                // emitted entry through the same destination identity map as
+                // lookup, including after rewind and on cached continuations.
+                let file = match checkpoint::open_beneath(&data.file.read().unwrap(), &entry.name) {
+                    Ok(file) => Some(file),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(file) = file {
+                    let (st, mnt_id) = statx(&file)?;
+                    let host = InodeAltKey {
+                        ino: st.st_ino,
+                        dev: st.st_dev,
+                        mnt_id,
+                    };
+                    guest_ino = self
+                        .restored_identities
+                        .write()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .number(host)?;
+                }
+            }
             if add_entry(DirEntry {
-                ino: entry.inode,
+                ino: guest_ino,
                 offset: (index + 1) as u64,
                 type_: entry.kind,
                 name: &entry.name,
@@ -1769,6 +1804,7 @@ impl FileSystem for PassthroughFs {
     fn destroy(&self) {
         self.handles.write().unwrap().clear();
         self.inodes.write().unwrap().clear();
+        *self.restored_identities.write().unwrap() = None;
         self.supplementary_group_extension
             .store(false, Ordering::Relaxed);
     }

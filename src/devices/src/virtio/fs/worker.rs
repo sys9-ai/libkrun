@@ -21,6 +21,9 @@ use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
 
+#[cfg(target_os = "linux")]
+const CHECKPOINT_STATE_LIMIT: usize = 64 * 1024 * 1024;
+
 enum FsServer {
     ReadWrite(Server<PassthroughFs>),
     ReadOnly(Server<PassthroughFsRo>),
@@ -237,11 +240,11 @@ impl FsWorker {
                 server.options.load(Ordering::Relaxed),
             ),
         };
-        let payload = bincode::serde::encode_to_vec(
-            (state, options, matches!(self.server, FsServer::ReadOnly(_))),
-            bincode::config::standard(),
-        )
-        .map_err(io::Error::other)?;
+        let payload = crate::checkpoint::encode::<_, CHECKPOINT_STATE_LIMIT>(&(
+            state,
+            options,
+            matches!(self.server, FsServer::ReadOnly(_)),
+        ))?;
         Ok(crate::virtio::DeviceSnapshot {
             queues: self.queues.iter().map(Queue::capture_state).collect(),
             payload,
@@ -251,13 +254,9 @@ impl FsWorker {
     pub fn restore_state(&mut self, payload: &[u8], directory: &std::path::Path) -> io::Result<()> {
         use super::passthrough::checkpoint::FilesystemState;
         use std::sync::atomic::Ordering;
-        let ((state, options, read_only), consumed): ((FilesystemState, u64, bool), usize) =
-            bincode::serde::decode_from_slice(
-                payload,
-                bincode::config::standard().with_limit::<67108864>(),
-            )
-            .map_err(io::Error::other)?;
-        if consumed != payload.len() || read_only != matches!(self.server, FsServer::ReadOnly(_)) {
+        let (state, options, read_only): (FilesystemState, u64, bool) =
+            crate::checkpoint::decode::<_, CHECKPOINT_STATE_LIMIT>(payload)?;
+        if read_only != matches!(self.server, FsServer::ReadOnly(_)) {
             return Err(io::Error::other(
                 "filesystem checkpoint access mode or payload differs",
             ));
@@ -273,5 +272,123 @@ impl FsWorker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::fs::filesystem::{Context, FileSystem, FsOptions};
+    use crate::virtio::fs::fuse;
+    use utils::eventfd::EFD_NONBLOCK;
+    use vm_memory::GuestAddress;
+
+    #[test]
+    fn memory_checkpoint_capture_rejects_unrestorable_directory_caches() {
+        let directory = std::env::temp_dir().join(format!(
+            "krun-fs-budget-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let root = directory.join("root");
+        let payloads = directory.join("payloads");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&payloads).unwrap();
+        let suffix = "x".repeat(236);
+        for index in 0..1024 {
+            std::fs::File::create(root.join(format!("{index:04}{suffix}"))).unwrap();
+        }
+
+        let new_worker = || {
+            FsWorker::new(
+                vec![Queue::new(1024), Queue::new(1024)],
+                Vec::new(),
+                InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint-test".into())
+                    .unwrap(),
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap(),
+                None,
+                passthrough::Config {
+                    root_dir: root.to_str().unwrap().into(),
+                    checkpoint_enabled: true,
+                    ..Default::default()
+                },
+                false,
+                EventFd::new(EFD_NONBLOCK).unwrap(),
+                Arc::new(AtomicI32::new(0)),
+            )
+            .unwrap()
+        };
+        let source = new_worker();
+        let FsServer::ReadWrite(server) = &source.server else {
+            unreachable!();
+        };
+        server.fs.init(FsOptions::empty()).unwrap();
+        let context = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let (handle, _) = server.fs.opendir(context, fuse::ROOT_ID, 0).unwrap();
+        let handle = handle.unwrap();
+        server
+            .fs
+            .readdir(context, fuse::ROOT_ID, handle, 4096, 0, |_| Ok(1))
+            .unwrap();
+        let small = source.capture_state(&payloads).unwrap();
+        let mut restored = new_worker();
+        restored.restore_state(&small.payload, &payloads).unwrap();
+        let FsServer::ReadWrite(restored_server) = &restored.server else {
+            unreachable!();
+        };
+        let mut remaining_entries = 0;
+        restored_server
+            .fs
+            .readdir(context, fuse::ROOT_ID, handle, 4096, 1, |_| {
+                remaining_entries += 1;
+                Ok(1)
+            })
+            .unwrap();
+        assert_eq!(remaining_entries, 1023);
+        drop(restored);
+
+        // Each real enumeration is below the 16 MiB per-handle limit. Retaining
+        // multiple handles grows checkpoint state without large files or a huge
+        // directory. The bincode decoder charges 8+4+8 bytes for each entry's
+        // inode/type/name length even when the varint encoding is smaller.
+        for _ in 0..255 {
+            let (handle, _) = server.fs.opendir(context, fuse::ROOT_ID, 0).unwrap();
+            let mut entries = 0;
+            server
+                .fs
+                .readdir(context, fuse::ROOT_ID, handle.unwrap(), 4096, 0, |_| {
+                    entries += 1;
+                    Ok(1)
+                })
+                .unwrap();
+            assert_eq!(entries, 1024);
+        }
+
+        let captured = source.capture_state(&payloads);
+        if let Ok(state) = &captured {
+            assert!(
+                state.payload.len() < 64 * 1024 * 1024,
+                "fixture must catch decoder-budget overflow below the encoded-size limit"
+            );
+            let error = new_worker()
+                .restore_state(&state.payload, &payloads)
+                .unwrap_err();
+            assert!(error.to_string().contains("LimitExceeded"), "{error}");
+        }
+        drop(source);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        let error = captured.err().expect(
+            "capture accepted directory caches that its own restore decoder rejects with LimitExceeded",
+        );
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("limit"),
+            "capture must reject the codec limit, not an unrelated failure: {error}"
+        );
     }
 }

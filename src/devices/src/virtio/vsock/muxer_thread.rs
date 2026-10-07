@@ -33,6 +33,204 @@ pub struct MuxerThread {
     unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::vsock::packet::{
+        TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr, VsockPacket,
+    };
+    use crate::virtio::vsock::proxy::ProxyStatus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::RwLock;
+    use vm_memory::GuestAddress;
+
+    struct CountingProxy {
+        event: EventFd,
+        handled: Arc<AtomicUsize>,
+    }
+
+    impl AsRawFd for CountingProxy {
+        fn as_raw_fd(&self) -> RawFd {
+            self.event.as_raw_fd()
+        }
+    }
+
+    impl Proxy for CountingProxy {
+        fn id(&self) -> u64 {
+            1
+        }
+
+        fn status(&self) -> ProxyStatus {
+            ProxyStatus::Connecting
+        }
+
+        fn process_event(&mut self, events: EventSet) -> ProxyUpdate {
+            assert!(events.contains(EventSet::IN));
+            assert_eq!(self.event.read().unwrap(), 1);
+            self.handled.fetch_add(1, Ordering::SeqCst);
+            ProxyUpdate::default()
+        }
+
+        fn connect(&mut self, _: &VsockPacket, _: TsiConnectReq) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn getpeername(&mut self, _: &VsockPacket) {
+            unreachable!()
+        }
+
+        fn sendmsg(&mut self, _: &VsockPacket) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn sendto_addr(&mut self, _: TsiSendtoAddr) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn listen(
+            &mut self,
+            _: &VsockPacket,
+            _: TsiListenReq,
+            _: &Option<HashMap<u16, u16>>,
+        ) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn accept(&mut self, _: TsiAcceptReq) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn update_peer_credit(&mut self, _: &VsockPacket) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn process_op_response(&mut self, _: &VsockPacket) -> ProxyUpdate {
+            unreachable!()
+        }
+
+        fn release(&mut self) -> ProxyUpdate {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn muxer_constructor_handles_eventfd_exhaustion() {
+        const CHILD: &str = "KRUN_TEST_MUXER_EVENTFD_EXHAUSTION";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "virtio::vsock::muxer_thread::tests::muxer_constructor_handles_eventfd_exhaustion",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "eventfd-exhaustion subprocess failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+            return;
+        }
+
+        let epoll = Epoll::new().unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint-test".into()).unwrap();
+        let (reaper_sender, _reaper_receiver) = crossbeam_channel::unbounded();
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // The child has all constructor inputs; only the constructor's control
+        // eventfd now needs a new descriptor. The parent retains its own limits.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            MuxerThread::new(
+                3,
+                epoll,
+                Arc::new(Mutex::new(MuxerRxQ::new())),
+                Arc::new(RwLock::new(HashMap::new())),
+                mem,
+                Arc::new(Mutex::new(VirtQueue::new(256))),
+                interrupt,
+                reaper_sender,
+                HashMap::new(),
+            )
+        }));
+        assert!(
+            result.is_ok(),
+            "creating the vsock control eventfd must report exhaustion without panicking"
+        );
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn quiesce_processes_proxy_edges_in_stop_batch() {
+        let handled = Arc::new(AtomicUsize::new(0));
+        let proxy = CountingProxy {
+            event: EventFd::new(EFD_NONBLOCK).unwrap(),
+            handled: handled.clone(),
+        };
+        let proxy_event = proxy.event.try_clone().unwrap();
+        let proxy_map: ProxyMap = Arc::new(RwLock::new(HashMap::new()));
+        proxy_map
+            .write()
+            .unwrap()
+            .insert(proxy.id(), Mutex::new(Box::new(proxy)));
+        let (reaper_sender, _reaper_receiver) = crossbeam_channel::unbounded();
+        let mut worker = MuxerThread::new(
+            3,
+            Epoll::new().unwrap(),
+            Arc::new(Mutex::new(MuxerRxQ::new())),
+            proxy_map,
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            InterruptTransport::new(DummyIrqChip::new().into(), "checkpoint-test".into()).unwrap(),
+            reaper_sender,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        // Model an initialized worker at its next wait. Register and make stop
+        // ready first so Linux returns it before the proxy's one-time edge.
+        worker
+            .epoll
+            .ctl(
+                ControlOperation::Add,
+                worker.stop.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN, 0),
+            )
+            .unwrap();
+        worker
+            .epoll
+            .ctl(
+                ControlOperation::Add,
+                proxy_event.as_raw_fd(),
+                &EpollEvent::new(EventSet::IN | EventSet::EDGE_TRIGGERED, 1),
+            )
+            .unwrap();
+        worker.initialized = true;
+        worker.stop.write(1).unwrap();
+        proxy_event.write(1).unwrap();
+
+        let worker = worker.run().join().unwrap();
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            1,
+            "quiesce discarded a delivered proxy edge after the stop event"
+        );
+
+        worker.stop.write(1).unwrap();
+        let _worker = worker.run().join().unwrap();
+        assert_eq!(handled.load(Ordering::SeqCst), 1);
+    }
+}
+
 impl MuxerThread {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -45,9 +243,9 @@ impl MuxerThread {
         interrupt: InterruptTransport,
         reaper_sender: Sender<u64>,
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
-    ) -> Self {
-        MuxerThread {
-            stop: Arc::new(EventFd::new(EFD_NONBLOCK).expect("vsock stop eventfd")),
+    ) -> std::io::Result<Self> {
+        Ok(MuxerThread {
+            stop: Arc::new(EventFd::new(EFD_NONBLOCK)?),
             initialized: false,
             cid,
             epoll,
@@ -58,7 +256,7 @@ impl MuxerThread {
             interrupt,
             reaper_sender,
             unix_ipc_port_map,
-        }
+        })
     }
 
     pub fn run(self) -> thread::JoinHandle<Self> {
@@ -199,13 +397,15 @@ impl MuxerThread {
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
+                    let mut stop_requested = false;
                     for ev in &epoll_events[0..ev_cnt] {
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
                         if id == 0 {
                             let _ = self.stop.read();
-                            return self;
+                            stop_requested = true;
+                            continue;
                         }
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
@@ -216,6 +416,11 @@ impl MuxerThread {
                         if let Some(update) = update {
                             self.process_proxy_update(id, update, &mut thread_rng);
                         }
+                    }
+                    // epoll has consumed every edge in this batch. Finish it
+                    // before pausing so resume cannot lose a proxy's only edge.
+                    if stop_requested {
+                        return self;
                     }
                 }
                 Err(e) => {

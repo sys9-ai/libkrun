@@ -313,11 +313,16 @@ impl VirtioDevice for Vsock {
 
         self.queue_tx = Some(Arc::new(Mutex::new(tx_queue)));
         self.queue_rx = Some(Arc::new(Mutex::new(rx_queue)));
-        self.muxer.activate(
-            mem.clone(),
-            self.queue_rx.clone().unwrap(),
-            interrupt.clone(),
-        );
+        self.muxer
+            .activate(
+                mem.clone(),
+                self.queue_rx.clone().unwrap(),
+                interrupt.clone(),
+            )
+            .map_err(|error| {
+                error!("Cannot activate vsock muxer: {error}");
+                ActivateError::BadActivate
+            })?;
 
         if self.restoring {
             let event_queue = self.queue_event.as_mut().unwrap();

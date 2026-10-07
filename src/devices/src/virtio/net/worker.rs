@@ -73,7 +73,9 @@ impl NetWorker {
         };
 
         Ok(Self {
-            stop: std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).expect("network stop eventfd")),
+            stop: std::sync::Arc::new(
+                EventFd::new(EFD_NONBLOCK).map_err(ConnectError::CreateEventFd)?,
+            ),
             rx_q,
             tx_q,
 
@@ -505,5 +507,92 @@ impl NetWorker {
             ],
             payload: Vec::new(),
         })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::Queue;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    #[test]
+    fn network_constructor_handles_eventfd_exhaustion() {
+        const CHILD: &str = "KRUN_TEST_NETWORK_EVENTFD_EXHAUSTION";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "virtio::net::worker::tests::network_constructor_handles_eventfd_exhaustion",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated constructor test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+            return;
+        }
+
+        // Prepare every input before exhausting FDs. Only the constructor's
+        // newly added stop event needs another descriptor.
+        let (backend, _peer) = UnixStream::pair().unwrap();
+        let rx = DeviceQueue::new(
+            Queue::new(256),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        );
+        let tx = DeviceQueue::new(
+            Queue::new(256),
+            Arc::new(EventFd::new(EFD_NONBLOCK).unwrap()),
+        );
+        let interrupt =
+            InterruptTransport::new(DummyIrqChip::new().into(), "test-net".into()).unwrap();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let backend = VirtioNetBackend::UnixstreamFd(backend.into_raw_fd());
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: both calls receive valid rlimit pointers; the limit only
+        // changes this dedicated subprocess, and existing FDs remain usable.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let exhausted = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: original.rlim_max,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &exhausted) },
+            0
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            NetWorker::new(rx, tx, interrupt, memory, 0, backend)
+        }));
+        // SAFETY: restore the soft limit before the test harness reports a failure.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+            0
+        );
+        assert!(
+            result.is_ok(),
+            "eventfd exhaustion must return an error, not panic"
+        );
+        match result.unwrap() {
+            Err(ConnectError::CreateEventFd(error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+            }
+            Err(error) => panic!("unexpected constructor failure: {error:?}"),
+            Ok(_) => panic!("eventfd exhaustion must reject activation"),
+        }
     }
 }

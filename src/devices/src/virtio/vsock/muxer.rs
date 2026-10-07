@@ -143,18 +143,7 @@ impl VsockMuxer {
         mem: GuestMemoryMmap,
         queue: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
-    ) {
-        self.queue = Some(queue.clone());
-        self.mem = Some(mem.clone());
-        self.interrupt = Some(interrupt.clone());
-
-        #[cfg(target_os = "macos")]
-        {
-            let timesync =
-                TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
-            timesync.run();
-        }
-
+    ) -> std::io::Result<()> {
         let (sender, receiver) = unbounded();
 
         let thread = MuxerThread::new(
@@ -162,18 +151,29 @@ impl VsockMuxer {
             self.epoll.clone(),
             self.rxq.clone(),
             self.proxy_map.clone(),
-            mem,
-            queue,
+            mem.clone(),
+            queue.clone(),
             interrupt.clone(),
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
-        );
+        )?;
+        self.queue = Some(queue.clone());
+        self.mem = Some(mem.clone());
+        self.interrupt = Some(interrupt.clone());
+
+        #[cfg(target_os = "macos")]
+        {
+            let timesync = TimesyncThread::new(self.cid, mem, queue, interrupt);
+            timesync.run();
+        }
+
         self.worker_stop = Some(thread.stop.clone());
         self.worker = Some(thread.run());
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
         reaper.run();
+        Ok(())
     }
 
     pub(crate) fn has_pending_rx(&self) -> bool {
