@@ -77,7 +77,44 @@ pub struct VirtioShmRegion {
 /// device. The transport constructs queues based on queue_config() and passes them to the device
 /// during activation, transferring ownership. After reset, the transport recreates queues
 /// from queue_config() for the next negotiation cycle.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DeviceSnapshot {
+    pub queues: Vec<super::QueueState>,
+    pub payload: Vec<u8>,
+}
+
 pub trait VirtioDevice: AsAny + Send {
+    /// Stop all background guest-memory access before returning.
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other(format!(
+            "{} does not support checkpoints",
+            self.device_name()
+        )))
+    }
+
+    fn capture_state(&self, _directory: &std::path::Path) -> std::io::Result<DeviceSnapshot> {
+        Err(std::io::Error::other(
+            "device checkpoint capture is unsupported",
+        ))
+    }
+
+    /// Prepare backend state before the transport activates restored queues.
+    fn restore_state(
+        &mut self,
+        _payload: &[u8],
+        _directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "device checkpoint restore is unsupported",
+        ))
+    }
+
+    fn resume(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "device checkpoint resume is unsupported",
+        ))
+    }
+
     /// Get the available features offered by device.
     fn avail_features(&self) -> u64;
 

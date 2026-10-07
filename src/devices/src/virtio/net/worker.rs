@@ -16,9 +16,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 pub struct NetWorker {
+    pub(super) stop: std::sync::Arc<EventFd>,
     rx_q: DeviceQueue,
     tx_q: DeviceQueue,
     interrupt: InterruptTransport,
@@ -71,6 +73,7 @@ impl NetWorker {
         };
 
         Ok(Self {
+            stop: std::sync::Arc::new(EventFd::new(EFD_NONBLOCK).expect("network stop eventfd")),
             rx_q,
             tx_q,
 
@@ -89,14 +92,14 @@ impl NetWorker {
         })
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> thread::JoinHandle<Self> {
         thread::Builder::new()
             .name("virtio-net worker".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
@@ -105,6 +108,14 @@ impl NetWorker {
         let backend_socket = self.backend.raw_socket_fd();
 
         let epoll = Epoll::new().unwrap();
+        let stop_fd = self.stop.as_raw_fd();
+        epoll
+            .ctl(
+                ControlOperation::Add,
+                stop_fd,
+                &EpollEvent::new(EventSet::IN, stop_fd as u64),
+            )
+            .unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -132,6 +143,10 @@ impl NetWorker {
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
                         let event_set = event.event_set();
+                        if source == stop_fd {
+                            let _ = self.stop.read();
+                            return self;
+                        }
                         match event_set {
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
@@ -471,5 +486,24 @@ impl NetWorker {
     fn read_into_rx_frame_buf_from_backend(&mut self) -> result::Result<(), ReadError> {
         self.rx_frame_buf_len = self.backend.read_frame(&mut self.rx_frame_buf)?;
         Ok(())
+    }
+}
+
+impl NetWorker {
+    pub(super) fn capture_state(&self) -> std::io::Result<crate::virtio::DeviceSnapshot> {
+        // Deferred frames are host-network state. Preserve them in the same VM
+        // when pausing, but do not publish a checkpoint that silently drops one.
+        if self.rx_has_deferred_frame || self.tx_has_deferred_frame {
+            return Err(std::io::Error::other(
+                "network has a deferred frame at checkpoint",
+            ));
+        }
+        Ok(crate::virtio::DeviceSnapshot {
+            queues: vec![
+                self.rx_q.queue.capture_state(),
+                self.tx_q.queue.capture_state(),
+            ],
+            payload: Vec::new(),
+        })
     }
 }

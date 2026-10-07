@@ -102,14 +102,14 @@ impl FsWorker {
         })
     }
 
-    pub fn run(self) -> thread::JoinHandle<()> {
+    pub fn run(self) -> thread::JoinHandle<Self> {
         thread::Builder::new()
             .name("fs worker".into())
             .spawn(|| self.work())
             .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self) -> Self {
         let virtq_hpq_ev_fd = self.queue_evts[HPQ_INDEX].as_raw_fd();
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
@@ -149,7 +149,7 @@ impl FsWorker {
                             EventSet::IN if source == stop_ev_fd => {
                                 debug!("stopping worker thread");
                                 let _ = self.stop_fd.read();
-                                return;
+                                return self;
                             }
                             _ => {
                                 log::warn!(
@@ -217,5 +217,61 @@ impl FsWorker {
                 self.interrupt.signal_used_queue();
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl FsWorker {
+    pub fn capture_state(
+        &self,
+        directory: &std::path::Path,
+    ) -> io::Result<crate::virtio::DeviceSnapshot> {
+        use std::sync::atomic::Ordering;
+        let (state, options) = match &self.server {
+            FsServer::ReadWrite(server) => (
+                server.fs.capture_state(directory)?,
+                server.options.load(Ordering::Relaxed),
+            ),
+            FsServer::ReadOnly(server) => (
+                server.fs.inner.capture_state(directory)?,
+                server.options.load(Ordering::Relaxed),
+            ),
+        };
+        let payload = bincode::serde::encode_to_vec(
+            (state, options, matches!(self.server, FsServer::ReadOnly(_))),
+            bincode::config::standard(),
+        )
+        .map_err(io::Error::other)?;
+        Ok(crate::virtio::DeviceSnapshot {
+            queues: self.queues.iter().map(Queue::capture_state).collect(),
+            payload,
+        })
+    }
+
+    pub fn restore_state(&mut self, payload: &[u8], directory: &std::path::Path) -> io::Result<()> {
+        use super::passthrough::checkpoint::FilesystemState;
+        use std::sync::atomic::Ordering;
+        let ((state, options, read_only), consumed): ((FilesystemState, u64, bool), usize) =
+            bincode::serde::decode_from_slice(
+                payload,
+                bincode::config::standard().with_limit::<67108864>(),
+            )
+            .map_err(io::Error::other)?;
+        if consumed != payload.len() || read_only != matches!(self.server, FsServer::ReadOnly(_)) {
+            return Err(io::Error::other(
+                "filesystem checkpoint access mode or payload differs",
+            ));
+        }
+        match &self.server {
+            FsServer::ReadWrite(server) => {
+                server.fs.restore_state(state, directory)?;
+                server.options.store(options, Ordering::Relaxed);
+            }
+            FsServer::ReadOnly(server) => {
+                server.fs.inner.restore_state(state, directory)?;
+                server.options.store(options, Ordering::Relaxed);
+            }
+        }
+        Ok(())
     }
 }

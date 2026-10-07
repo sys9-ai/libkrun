@@ -207,7 +207,8 @@ pub struct Block {
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<BlockWorker>>,
+    paused_worker: Option<BlockWorker>,
     worker_stopfd: EventFd,
 
     // Virtio fields.
@@ -326,6 +327,7 @@ impl Block {
             acked_features: 0u64,
             device_state: DeviceState::Inactive,
             worker_thread: None,
+            paused_worker: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK)?,
         })
     }
@@ -347,6 +349,58 @@ impl Block {
 }
 
 impl VirtioDevice for Block {
+    fn quiesce(&mut self) -> io::Result<()> {
+        if let Some(worker) = self.worker_thread.take() {
+            self.worker_stopfd.write(1)?;
+            self.paused_worker = Some(
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("block worker panicked"))?,
+            );
+        }
+        let disk = self.disk_image.lock().unwrap();
+        disk.flush()?;
+        disk.sync()?;
+        Ok(())
+    }
+
+    fn capture_state(
+        &self,
+        _directory: &std::path::Path,
+    ) -> io::Result<crate::virtio::DeviceSnapshot> {
+        let worker = self
+            .paused_worker
+            .as_ref()
+            .ok_or_else(|| io::Error::other("block worker is not paused"))?;
+        let mut payload = self.config.as_slice().to_vec();
+        payload.extend_from_slice(&self.disk_image_id);
+        Ok(crate::virtio::DeviceSnapshot {
+            queues: vec![worker.device_queue.queue.capture_state()],
+            payload,
+        })
+    }
+
+    fn restore_state(&mut self, payload: &[u8], _directory: &std::path::Path) -> io::Result<()> {
+        let config = self.config.as_slice();
+        if payload.len() != config.len() + VIRTIO_BLK_ID_BYTES as usize
+            || &payload[..config.len()] != config
+        {
+            return Err(io::Error::other("checkpoint block geometry differs"));
+        }
+        self.disk_image_id = payload[config.len()..].to_vec();
+        if let Some(disk) = &mut self.disk {
+            disk.image_id = self.disk_image_id.clone();
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> io::Result<()> {
+        if let Some(worker) = self.paused_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
+        Ok(())
+    }
+
     fn device_type(&self) -> u32 {
         TYPE_BLOCK
     }

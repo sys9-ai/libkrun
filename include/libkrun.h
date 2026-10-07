@@ -118,6 +118,11 @@ int32_t krun_set_vm_config(uint32_t ctx_id, uint8_t num_vcpus, uint32_t ram_mib)
  */
 int32_t krun_set_root(uint32_t ctx_id, const char *root_path);
 
+/* Experimental Linux/amd64 checkpoints. All paths are host paths. */
+int32_t krun_set_checkpoint_socket(uint32_t ctx_id, const char *socket_path);
+int32_t krun_set_restore_path(uint32_t ctx_id, const char *directory);
+int32_t krun_set_restore_ready_socket(uint32_t ctx_id, const char *socket_path);
+
 /**
  * DEPRECATED. Use krun_add_disk instead.
  *

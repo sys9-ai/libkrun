@@ -87,6 +87,20 @@ pub struct MMIODeviceManager {
 }
 
 impl MMIODeviceManager {
+    pub fn checkpoint_devices(&self) -> Vec<(u32, String, u64)> {
+        let mut devices: Vec<_> = self
+            .id_to_dev_info
+            .iter()
+            .filter_map(|((kind, id), info)| match kind {
+                DeviceType::Virtio(kind) => Some((*kind, id.clone(), info.addr)),
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                _ => None,
+            })
+            .collect();
+        devices.sort_by_key(|(_, _, address)| *address);
+        devices
+    }
+
     /// Create a new DeviceManager handling mmio devices (virtio net, block).
     pub fn new(mmio_base: &mut u64, irq_interval: (u32, u32)) -> MMIODeviceManager {
         if cfg!(any(target_arch = "aarch64", target_arch = "riscv64")) {

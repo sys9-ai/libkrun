@@ -56,7 +56,7 @@ fn read_only_open_flags(flags: u32) -> io::Result<u32> {
 }
 
 pub struct PassthroughFsRo {
-    inner: PassthroughFs,
+    pub(super) inner: PassthroughFs,
 }
 
 impl PassthroughFsRo {

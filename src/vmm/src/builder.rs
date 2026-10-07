@@ -562,6 +562,13 @@ pub fn build_microvm(
     _shutdown_efd: Option<EventFd>,
     _sender: Sender<WorkerMessage>,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let checkpoint = vm_resources
+        .restore_path
+        .as_ref()
+        .map(|directory| crate::checkpoint::read_checkpoint(directory))
+        .transpose()
+        .map_err(|e| StartMicrovmError::Internal(Error::Checkpoint(e)))?;
     let payload = choose_payload(vm_resources)?;
 
     let (guest_memory, arch_memory_info, mut _shm_manager, payload_config) = create_guest_memory(
@@ -571,6 +578,8 @@ pub fn build_microvm(
             .ok_or(StartMicrovmError::MissingMemSizeConfig)?,
         vm_resources,
         &payload,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        checkpoint.as_ref(),
     )?;
 
     let vcpu_config = vm_resources.vcpu_config();
@@ -830,6 +839,7 @@ pub fn build_microvm(
             &pio_device_manager.io_bus,
             &exit_evt,
             kernel_boot,
+            vm_resources.restore_path.is_some(),
             #[cfg(feature = "tee")]
             _sender,
         )
@@ -950,6 +960,8 @@ pub fn build_microvm(
         arch_memory_info,
         kernel_cmdline,
         vcpus_handles: Vec::new(),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        checkpoint_control: crate::checkpoint::CheckpointControl::default(),
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
@@ -1028,6 +1040,8 @@ pub fn build_microvm(
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_fs_devices(
         &mut vmm,
+        cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            && (vm_resources.checkpoint_socket.is_some() || vm_resources.restore_path.is_some()),
         &vm_resources.fs,
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
@@ -1070,15 +1084,19 @@ pub fn build_microvm(
     // Write the kernel command line to guest memory. This is x86_64 specific, since on
     // aarch64 the command line will be specified through the FDT.
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
-    load_cmdline(&vmm)?;
+    if vm_resources.restore_path.is_none() {
+        load_cmdline(&vmm)?;
+    }
 
-    vmm.configure_system(
-        vcpus.as_slice(),
-        &intc,
-        &payload_config.initrd_config,
-        &vm_resources.smbios_oem_strings,
-    )
-    .map_err(StartMicrovmError::Internal)?;
+    if vm_resources.restore_path.is_none() {
+        vmm.configure_system(
+            vcpus.as_slice(),
+            &intc,
+            &payload_config.initrd_config,
+            &vm_resources.smbios_oem_strings,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
 
     #[cfg(feature = "tee")]
     {
@@ -1114,6 +1132,18 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(directory) = &vm_resources.restore_path {
+        let state = checkpoint.expect("restore path loaded a checkpoint before construction");
+        vmm.start_vcpus_paused(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+        vmm.restore_checkpoint(state, directory)
+            .map_err(|e| StartMicrovmError::Internal(Error::Checkpoint(e)))?;
+    } else {
+        vmm.start_vcpus(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
 
@@ -1426,6 +1456,9 @@ pub fn create_guest_memory(
     mem_size: usize,
     vm_resources: &VmResources,
     payload: &Payload,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))] checkpoint: Option<
+        &crate::checkpoint::Checkpoint,
+    >,
 ) -> std::result::Result<
     (GuestMemoryMmap, ArchMemoryInfo, ShmManager, PayloadConfig),
     StartMicrovmError,
@@ -1499,6 +1532,48 @@ pub fn create_guest_memory(
     }
 
     arch_mem_regions.extend(shm_manager.regions());
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(directory) = &vm_resources.restore_path {
+        if vm_resources.split_irqchip
+            || cfg!(feature = "tee")
+            || vm_resources.firmware_config.is_some()
+        {
+            return Err(StartMicrovmError::Internal(Error::Checkpoint(
+                io::Error::other("unsupported checkpoint machine profile"),
+            )));
+        }
+        if let Payload::KernelMmap = payload {
+            let kernel = vm_resources
+                .kernel_bundle
+                .as_ref()
+                .ok_or(StartMicrovmError::MissingKernelConfig)?;
+            arch_mem_regions.push((GuestAddress(kernel.guest_addr), kernel.size));
+        }
+        arch_mem_regions.sort_by_key(|(address, _)| address.raw_value());
+        let guest_mem = crate::checkpoint::map_checkpoint_memory(
+            directory,
+            &arch_mem_regions,
+            checkpoint.ok_or_else(|| {
+                StartMicrovmError::Internal(Error::Checkpoint(io::Error::other(
+                    "missing restore state",
+                )))
+            })?,
+        )
+        .map_err(|e| StartMicrovmError::Internal(Error::Checkpoint(e)))?;
+        // No cold-boot kernel, GDT, cmdline, or boot-parameter writes may touch
+        // these MAP_PRIVATE mappings: first access must fault in saved bytes.
+        return Ok((
+            guest_mem,
+            arch_mem_info,
+            shm_manager,
+            PayloadConfig {
+                entry_addr: GuestAddress(0),
+                initrd_config: None,
+                kernel_cmdline: None,
+            },
+        ));
+    }
 
     let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
         .map_err(|e| StartMicrovmError::GuestMemoryMmap(format!("{e:?}")))?;
@@ -1726,6 +1801,7 @@ fn create_vcpus_x86_64(
     io_bus: &devices::Bus,
     exit_evt: &EventFd,
     kernel_boot: bool,
+    restoring: bool,
     #[cfg(feature = "tee")] pm_sender: Sender<WorkerMessage>,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
@@ -1742,8 +1818,10 @@ fn create_vcpus_x86_64(
         )
         .map_err(Error::Vcpu)?;
 
-        vcpu.configure_x86_64(guest_mem, entry_addr, vcpu_config, kernel_boot)
-            .map_err(Error::Vcpu)?;
+        if !restoring {
+            vcpu.configure_x86_64(guest_mem, entry_addr, vcpu_config, kernel_boot)
+                .map_err(Error::Vcpu)?;
+        }
 
         vcpus.push(vcpu);
     }
@@ -1876,6 +1954,7 @@ fn attach_mmio_device(
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
+    _checkpoint_enabled: bool,
     fs_devs: &[FsDeviceConfig],
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
@@ -1896,6 +1975,11 @@ fn attach_fs_devices(
             )
             .unwrap(),
         ));
+
+        #[cfg(target_os = "linux")]
+        if _checkpoint_enabled {
+            fs.lock().unwrap().enable_checkpoint();
+        }
 
         let id = format!("{}{}", String::from(fs.lock().unwrap().id()), i);
 
@@ -2354,7 +2438,13 @@ pub mod tests {
             size: 0x1000,
         });
 
-        create_guest_memory(mem_size_mib, &vm_resources, &Payload::Empty)
+        create_guest_memory(
+            mem_size_mib,
+            &vm_resources,
+            &Payload::Empty,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            None,
+        )
     }
 
     #[test]
@@ -2385,6 +2475,7 @@ pub mod tests {
             &bus,
             &EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(vcpu_vec.len(), vcpu_count as usize);

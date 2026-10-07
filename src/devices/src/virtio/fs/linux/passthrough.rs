@@ -27,8 +27,6 @@ use super::super::filesystem::{
 use super::super::fuse;
 use super::super::multikey::MultikeyBTreeMap;
 
-const CURRENT_DIR_CSTR: &[u8] = b".\0";
-const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
 const INIT_CSTR: &[u8] = b"init.krun\0";
@@ -38,6 +36,8 @@ const GUEST_XATTR_PREFIX: &[u8] = b"user.containers.guest_xattr.";
 const UID_MAX: u32 = u32::MAX - 1;
 
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
+
+pub mod checkpoint;
 
 type Inode = u64;
 type Handle = u64;
@@ -51,6 +51,8 @@ struct InodeAltKey {
 
 struct InodeData {
     inode: Inode,
+    // Guest stat identity survives reopening on a different host filesystem.
+    guest_ino: u64,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
     file: File,
     dev: u64,
@@ -62,6 +64,7 @@ struct HandleData {
     inode: Inode,
     file: RwLock<File>,
     exported: AtomicBool,
+    directory: RwLock<Option<Vec<checkpoint::DirectoryEntry>>>,
 }
 
 #[repr(C, packed)]
@@ -872,6 +875,10 @@ fn stat(
 }
 
 fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
+    statx_with_flags(f, 0)
+}
+
+fn statx_with_flags(f: &File, flags: i32) -> io::Result<(libc::stat64, u64)> {
     let mut stx = MaybeUninit::<libc::statx>::zeroed();
 
     // Safe because this is a constant value and a valid C string.
@@ -883,7 +890,7 @@ fn statx(f: &File) -> io::Result<(libc::stat64, u64)> {
         libc::statx(
             f.as_raw_fd(),
             pathname.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | flags,
             libc::STATX_BASIC_STATS | libc::STATX_MNT_ID,
             stx.as_mut_ptr(),
         )
@@ -1016,6 +1023,7 @@ pub struct Config {
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
     pub allow_root_dir_delete: bool,
+    pub checkpoint_enabled: bool,
 }
 
 impl Default for Config {
@@ -1031,6 +1039,7 @@ impl Default for Config {
             export_fsid: 0,
             export_table: None,
             allow_root_dir_delete: false,
+            checkpoint_enabled: false,
         }
     }
 }
@@ -1064,6 +1073,7 @@ pub struct PassthroughFs {
     // Whether writeback caching is enabled for this directory. This will only be true when
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
+    dax_used: AtomicBool,
     announce_submounts: AtomicBool,
     supplementary_group_extension: AtomicBool,
     my_uid: Option<libc::uid_t>,
@@ -1168,6 +1178,7 @@ impl PassthroughFs {
             proc_self_fd,
 
             writeback: AtomicBool::new(false),
+            dax_used: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
             supplementary_group_extension: AtomicBool::new(false),
             my_uid,
@@ -1271,7 +1282,7 @@ impl PassthroughFs {
 
         let (st, mnt_id) = statx(&f)?;
         let (uid, gid, mode) = get_override_xattr(f.as_raw_fd())?;
-        let attr = apply_override_stat(st, uid, gid, mode, self.my_uid, self.my_gid);
+        let mut attr = apply_override_stat(st, uid, gid, mode, self.my_uid, self.my_gid);
 
         let mut attr_flags: u32 = 0;
 
@@ -1292,6 +1303,7 @@ impl PassthroughFs {
         let inode = if let Some(data) = data {
             // Matches with the release store in `forget`.
             data.refcount.fetch_add(1, Ordering::Acquire);
+            attr.st_ino = data.guest_ino;
             data.inode
         } else {
             // There is a possible race here where 2 threads end up adding the same file
@@ -1307,6 +1319,7 @@ impl PassthroughFs {
                 },
                 Arc::new(InodeData {
                     inode,
+                    guest_ino: st.st_ino,
                     file: f,
                     dev: st.st_dev,
                     mnt_id,
@@ -1353,85 +1366,113 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let mut buf = vec![0; size as usize];
+        if !self.cfg.checkpoint_enabled {
+            let mut buf = vec![0; size as usize];
 
-        {
-            // Since we are going to work with the kernel offset, we have to acquire the file lock
-            // for both the `lseek64` and `getdents64` syscalls to ensure that no other thread
-            // changes the kernel offset while we are using it.
-            let dir = data.file.write().unwrap();
+            {
+                // Since we are going to work with the kernel offset, we have to acquire the file lock
+                // for both the `lseek64` and `getdents64` syscalls to ensure that no other thread
+                // changes the kernel offset while we are using it.
+                let dir = data.file.write().unwrap();
 
-            // Safe because this doesn't modify any memory and we check the return value.
-            let res =
-                unsafe { libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET) };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe {
+                    libc::lseek64(dir.as_raw_fd(), offset as libc::off64_t, libc::SEEK_SET)
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+
+                // Safe because the kernel guarantees that it will only write to `buf` and we check the
+                // return value.
+                let res = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        dir.as_raw_fd(),
+                        buf.as_mut_ptr() as *mut LinuxDirent64,
+                        size as libc::c_int,
+                    )
+                };
+                if res < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                buf.resize(res as usize, 0);
+
+                // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
+                mem::drop(dir);
             }
 
-            // Safe because the kernel guarantees that it will only write to `buf` and we check the
-            // return value.
-            let res = unsafe {
-                libc::syscall(
-                    libc::SYS_getdents64,
-                    dir.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut LinuxDirent64,
-                    size as libc::c_int,
-                )
-            };
-            if res < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            buf.resize(res as usize, 0);
+            let mut rem = &buf[..];
+            while !rem.is_empty() {
+                // We only use debug asserts here because these values are coming from the kernel and we
+                // trust them implicitly.
+                debug_assert!(
+                    rem.len() >= size_of::<LinuxDirent64>(),
+                    "not enough space left in `rem`"
+                );
 
-            // Explicitly drop the lock so that it's not held while we fill in the fuse buffer.
-            mem::drop(dir);
+                let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
+
+                let dirent64 = LinuxDirent64::from_slice(front)
+                    .expect("unable to get LinuxDirent64 from slice");
+
+                let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
+                debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
+
+                let name = &back[..namelen];
+                let term = name
+                    .iter()
+                    .position(|&a| a == 0)
+                    .expect("LinuxDirent64 name not NUL-terminated");
+                let name = &name[..term];
+                let res = if name == b"." || name == b".." {
+                    // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
+                    // break the loop so return `Ok` with a non-zero value instead.
+                    Ok(1)
+                } else {
+                    add_entry(DirEntry {
+                        ino: dirent64.d_ino,
+                        offset: dirent64.d_off as u64,
+                        type_: u32::from(dirent64.d_ty),
+                        name,
+                    })
+                };
+
+                debug_assert!(
+                    rem.len() >= dirent64.d_reclen as usize,
+                    "rem is smaller than `d_reclen`"
+                );
+
+                match res {
+                    Ok(0) => break,
+                    Ok(_) => rem = &rem[dirent64.d_reclen as usize..],
+                    Err(e) => return Err(e),
+                }
+            }
+
+            return Ok(());
         }
 
-        let mut rem = &buf[..];
-        while !rem.is_empty() {
-            // We only use debug asserts here because these values are coming from the kernel and we
-            // trust them implicitly.
-            debug_assert!(
-                rem.len() >= size_of::<LinuxDirent64>(),
-                "not enough space left in `rem`"
-            );
-
-            let (front, back) = rem.split_at(size_of::<LinuxDirent64>());
-
-            let dirent64 =
-                LinuxDirent64::from_slice(front).expect("unable to get LinuxDirent64 from slice");
-
-            let namelen = dirent64.d_reclen as usize - size_of::<LinuxDirent64>();
-            debug_assert!(namelen <= back.len(), "back is smaller than `namelen`");
-
-            let name = &back[..namelen];
-            let term = name
-                .iter()
-                .position(|&a| a == 0)
-                .expect("LinuxDirent64 name not NUL-terminated");
-            let name = &name[..term];
-            let res = if name.starts_with(CURRENT_DIR_CSTR) || name.starts_with(PARENT_DIR_CSTR) {
-                // We don't want to report the "." and ".." entries. However, returning `Ok(0)` will
-                // break the loop so return `Ok` with a non-zero value instead.
-                Ok(1)
-            } else {
-                add_entry(DirEntry {
-                    ino: dirent64.d_ino,
-                    offset: dirent64.d_off as u64,
-                    type_: u32::from(dirent64.d_ty),
-                    name,
-                })
-            };
-
-            debug_assert!(
-                rem.len() >= dirent64.d_reclen as usize,
-                "rem is smaller than `d_reclen`"
-            );
-
-            match res {
-                Ok(0) => break,
-                Ok(_) => rem = &rem[dirent64.d_reclen as usize..],
-                Err(e) => return Err(e),
+        // Guest cookies are logical entry positions, independent of host getdents
+        // offsets. Keep the enumeration with the handle across checkpoint/restore.
+        let mut directory = data.directory.write().unwrap();
+        if offset == 0 || directory.is_none() {
+            *directory = Some(checkpoint::read_directory(&data.file.write().unwrap())?);
+        }
+        let entries = directory.as_ref().unwrap();
+        let start = usize::try_from(offset).map_err(|_| einval())?;
+        if start > entries.len() {
+            return Err(einval());
+        }
+        for (index, entry) in entries.iter().enumerate().skip(start) {
+            if add_entry(DirEntry {
+                ino: entry.inode,
+                offset: (index + 1) as u64,
+                type_: entry.kind,
+                name: &entry.name,
+            })? == 0
+            {
+                break;
             }
         }
 
@@ -1467,6 +1508,7 @@ impl PassthroughFs {
             inode,
             file,
             exported: Default::default(),
+            directory: RwLock::new(None),
         };
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -1525,7 +1567,8 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = stat(&data.file, self.my_uid, self.my_gid)?;
+        let mut st = stat(&data.file, self.my_uid, self.my_gid)?;
+        st.st_ino = data.guest_ino;
 
         Ok((st, self.cfg.attr_timeout))
     }
@@ -1696,6 +1739,7 @@ impl FileSystem for PassthroughFs {
             },
             Arc::new(InodeData {
                 inode: fuse::ROOT_ID,
+                guest_ino: st.st_ino,
                 file: f,
                 dev: st.st_dev,
                 mnt_id,
@@ -1878,14 +1922,8 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.do_lookup(inode, name)?;
+            let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+            let entry = self.do_lookup(inode, name.as_c_str())?;
 
             add_entry(dir_entry, entry)
         })
@@ -1997,6 +2035,7 @@ impl FileSystem for PassthroughFs {
             inode: entry.inode,
             file,
             exported: Default::default(),
+            directory: RwLock::new(None),
         };
 
         self.handles.write().unwrap().insert(handle, Arc::new(data));
@@ -2815,6 +2854,9 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
+        // Conservatively reject checkpoints once this window has been used;
+        // even removed DAX ranges may now contain PROT_NONE mappings.
+        self.dax_used.store(true, Ordering::Relaxed);
         let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
             libc::O_RDWR
         } else {

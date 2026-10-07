@@ -70,6 +70,9 @@ pub enum VirtioNetBackend {
 }
 
 pub struct Net {
+    worker: Option<std::thread::JoinHandle<NetWorker>>,
+    paused_worker: Option<NetWorker>,
+    worker_stop: Option<std::sync::Arc<utils::eventfd::EventFd>>,
     id: String,
     pub cfg_backend: VirtioNetBackend,
 
@@ -101,6 +104,9 @@ impl Net {
         };
 
         Ok(Net {
+            worker: None,
+            paused_worker: None,
+            worker_stop: None,
             id,
             cfg_backend,
 
@@ -124,6 +130,49 @@ impl Net {
 }
 
 impl VirtioDevice for Net {
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        if let Some(worker) = self.worker.take() {
+            self.worker_stop
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("missing network stop event"))?
+                .write(1)?;
+            self.paused_worker = Some(
+                worker
+                    .join()
+                    .map_err(|_| std::io::Error::other("network worker panicked"))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn capture_state(
+        &self,
+        _directory: &std::path::Path,
+    ) -> std::io::Result<crate::virtio::DeviceSnapshot> {
+        self.paused_worker
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("network is not paused"))?
+            .capture_state()
+    }
+
+    fn restore_state(
+        &mut self,
+        payload: &[u8],
+        _directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        if !payload.is_empty() {
+            return Err(std::io::Error::other("invalid network checkpoint"));
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> std::io::Result<()> {
+        if let Some(worker) = self.paused_worker.take() {
+            self.worker = Some(worker.run());
+        }
+        Ok(())
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -190,7 +239,8 @@ impl VirtioDevice for Net {
             self.cfg_backend.clone(),
         ) {
             Ok(worker) => {
-                worker.run();
+                self.worker_stop = Some(worker.stop.clone());
+                self.worker = Some(worker.run());
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
             }

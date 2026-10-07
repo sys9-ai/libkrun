@@ -64,8 +64,10 @@ enum PortState {
     Active {
         stopfd: utils::eventfd::EventFd,
         stop: Arc<AtomicBool>,
-        rx_thread: Option<JoinHandle<()>>,
-        tx_thread: Option<JoinHandle<()>>,
+        rx_thread: Option<JoinHandle<Queue>>,
+        idle_rx: Option<Queue>,
+        tx_thread: Option<JoinHandle<Queue>>,
+        idle_tx: Option<Queue>,
     },
 }
 
@@ -140,7 +142,10 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
+        let mut idle_rx = Some(rx_queue);
+        let mut idle_tx = Some(tx_queue);
         let rx_thread = input.map(|input| {
+            let rx_queue = idle_rx.take().unwrap();
             let mem = mem.clone();
             let interrupt = interrupt.clone();
             let port_id = self.port_id;
@@ -157,6 +162,7 @@ impl Port {
         });
 
         let tx_thread = output.map(|output| {
+            let tx_queue = idle_tx.take().unwrap();
             let stop = stop.clone();
             thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
         });
@@ -166,37 +172,50 @@ impl Port {
             stop,
             rx_thread,
             tx_thread,
+            idle_rx,
+            idle_tx,
         }
     }
 
-    pub fn shutdown(&mut self) {
-        if let PortState::Active {
+    pub fn quiesce(&mut self) -> std::io::Result<Option<(Queue, Queue)>> {
+        let state = mem::replace(&mut self.state, PortState::Inactive);
+        let PortState::Active {
             stopfd,
             stop,
-            tx_thread,
             rx_thread,
-        } = &mut self.state
-        {
-            stop.store(true, Ordering::Release);
-            if let Some(tx_thread) = mem::take(tx_thread) {
-                tx_thread.thread().unpark();
-                if let Err(e) = tx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
-                }
-            }
-            stopfd.write(1).unwrap();
-            if let Some(rx_thread) = mem::take(rx_thread) {
-                rx_thread.thread().unpark();
-                if let Err(e) = rx_thread.join() {
-                    log::error!(
-                        "Failed to flush tx for port {port_id}, thread panicked: {e:?}",
-                        port_id = self.port_id
-                    )
-                }
-            }
+            tx_thread,
+            idle_rx,
+            idle_tx,
+        } = state
+        else {
+            return Ok(None);
         };
+        stop.store(true, Ordering::Release);
+        stopfd.write(1)?;
+        if let Some(thread) = &rx_thread {
+            thread.thread().unpark();
+        }
+        if let Some(thread) = &tx_thread {
+            thread.thread().unpark();
+        }
+        let rx = match rx_thread {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| std::io::Error::other("console input worker panicked"))?,
+            None => idle_rx.ok_or_else(|| std::io::Error::other("console input queue missing"))?,
+        };
+        let tx = match tx_thread {
+            Some(thread) => thread
+                .join()
+                .map_err(|_| std::io::Error::other("console output worker panicked"))?,
+            None => idle_tx.ok_or_else(|| std::io::Error::other("console output queue missing"))?,
+        };
+        Ok(Some((rx, tx)))
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Err(error) = self.quiesce() {
+            log::error!("console shutdown failed: {error}");
+        }
     }
 }

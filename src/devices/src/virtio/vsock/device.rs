@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use utils::byte_order;
 use utils::eventfd::EventFd;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
@@ -37,6 +37,8 @@ pub(crate) const AVAIL_FEATURES: u64 = (1 << uapi::VIRTIO_F_VERSION_1 as u64)
 
 pub struct Vsock {
     cid: u64,
+    queue_event: Option<VirtQueue>,
+    restoring: bool,
     pub(crate) muxer: VsockMuxer,
     pub(crate) queue_rx: Option<Arc<Mutex<VirtQueue>>>,
     pub(crate) queue_tx: Option<Arc<Mutex<VirtQueue>>>,
@@ -58,6 +60,8 @@ impl Vsock {
     ) -> super::Result<Vsock> {
         Ok(Vsock {
             cid,
+            queue_event: None,
+            restoring: false,
             muxer: VsockMuxer::new(cid, host_port_map, unix_ipc_port_map, tsi_flags),
             queue_rx: None,
             queue_tx: None,
@@ -181,6 +185,53 @@ impl Vsock {
 }
 
 impl VirtioDevice for Vsock {
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        self.muxer.quiesce()
+    }
+
+    fn capture_state(
+        &self,
+        _directory: &std::path::Path,
+    ) -> std::io::Result<crate::virtio::DeviceSnapshot> {
+        let rx = self
+            .queue_rx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("vsock rx queue missing"))?;
+        let tx = self
+            .queue_tx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("vsock tx queue missing"))?;
+        let event = self
+            .queue_event
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("vsock event queue missing"))?;
+        Ok(crate::virtio::DeviceSnapshot {
+            queues: vec![
+                rx.lock().unwrap().capture_state(),
+                tx.lock().unwrap().capture_state(),
+                event.capture_state(),
+            ],
+            payload: self.cid.to_le_bytes().to_vec(),
+        })
+    }
+
+    fn restore_state(
+        &mut self,
+        payload: &[u8],
+        _directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        if payload != self.cid.to_le_bytes() {
+            return Err(std::io::Error::other("vsock checkpoint CID differs"));
+        }
+        self.restoring = true;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> std::io::Result<()> {
+        self.muxer.resume();
+        Ok(())
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -256,7 +307,7 @@ impl VirtioDevice for Vsock {
         // Extract queues from DeviceQueues and wrap in Arc<Mutex<>>.
         let mut queues_vec: Vec<VirtQueue> = queues.into_iter().map(|dq| dq.queue).collect();
         // Note: EVQ (index 2) is currently unused, we just take it to maintain the vec.
-        let _evq = queues_vec.pop().unwrap();
+        self.queue_event = queues_vec.pop();
         let tx_queue = queues_vec.pop().unwrap();
         let rx_queue = queues_vec.pop().unwrap();
 
@@ -268,6 +319,23 @@ impl VirtioDevice for Vsock {
             interrupt.clone(),
         );
 
+        if self.restoring {
+            let event_queue = self.queue_event.as_mut().unwrap();
+            let descriptor = event_queue.pop(&mem).ok_or(ActivateError::BadActivate)?;
+            if !descriptor.is_write_only() || descriptor.len < 4 {
+                return Err(ActivateError::BadActivate);
+            }
+            let index = descriptor.index;
+            // VIRTIO_VSOCK_EVENT_TRANSPORT_RESET: discard old host connections,
+            // preserve guest listeners, and accept new connections on this host.
+            mem.write_obj(0u32, descriptor.addr)
+                .map_err(|_| ActivateError::BadActivate)?;
+            event_queue
+                .add_used(&mem, index, 4)
+                .map_err(|_| ActivateError::BadActivate)?;
+            interrupt.signal_used_queue();
+            self.restoring = false;
+        }
         self.device_state = DeviceState::Activated(mem, interrupt);
 
         Ok(())

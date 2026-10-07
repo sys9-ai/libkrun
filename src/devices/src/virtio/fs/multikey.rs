@@ -107,6 +107,10 @@ where
         })
     }
 
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.main.values().map(|(_, value)| value)
+    }
+
     /// Clears the map, removing all values.
     pub fn clear(&mut self) {
         self.alt.clear();

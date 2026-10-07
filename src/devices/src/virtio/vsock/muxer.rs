@@ -97,6 +97,9 @@ pub fn push_packet(
 }
 
 pub struct VsockMuxer {
+    worker: Option<std::thread::JoinHandle<MuxerThread>>,
+    paused_worker: Option<MuxerThread>,
+    worker_stop: Option<Arc<utils::eventfd::EventFd>>,
     cid: u64,
     host_port_map: Option<HashMap<u16, u16>>,
     queue: Option<Arc<Mutex<VirtQueue>>>,
@@ -118,6 +121,9 @@ impl VsockMuxer {
         tsi_flags: TsiFlags,
     ) -> Self {
         VsockMuxer {
+            worker: None,
+            paused_worker: None,
+            worker_stop: None,
             cid,
             host_port_map,
             queue: None,
@@ -162,7 +168,8 @@ impl VsockMuxer {
             sender.clone(),
             self.unix_ipc_port_map.clone().unwrap_or_default(),
         );
-        thread.run();
+        self.worker_stop = Some(thread.stop.clone());
+        self.worker = Some(thread.run());
 
         self.reaper_sender = Some(sender);
         let reaper = ReaperThread::new(receiver, self.proxy_map.clone());
@@ -709,5 +716,28 @@ impl VsockMuxer {
             _ => warn!("stream: unhandled op={}", pkt.op()),
         }
         Ok(())
+    }
+}
+
+impl VsockMuxer {
+    pub(super) fn quiesce(&mut self) -> std::io::Result<()> {
+        if let Some(worker) = self.worker.take() {
+            self.worker_stop
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("missing vsock stop event"))?
+                .write(1)?;
+            self.paused_worker = Some(
+                worker
+                    .join()
+                    .map_err(|_| std::io::Error::other("vsock worker panicked"))?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn resume(&mut self) {
+        if let Some(worker) = self.paused_worker.take() {
+            self.worker = Some(worker.run());
+        }
     }
 }
