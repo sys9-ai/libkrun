@@ -351,7 +351,62 @@ pub struct Queue {
     num_added: Wrapping<u16>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct QueueState {
+    max_size: u16,
+    size: u16,
+    ready: bool,
+    desc_table: u64,
+    avail_ring: u64,
+    used_ring: u64,
+    next_avail: u16,
+    next_used: u16,
+    event_idx_enabled: bool,
+    num_added: u16,
+}
+
 impl Queue {
+    pub fn capture_state(&self) -> QueueState {
+        QueueState {
+            max_size: self.max_size,
+            size: self.size,
+            ready: self.ready,
+            desc_table: self.desc_table.0,
+            avail_ring: self.avail_ring.0,
+            used_ring: self.used_ring.0,
+            next_avail: self.next_avail.0,
+            next_used: self.next_used.0,
+            event_idx_enabled: self.event_idx_enabled,
+            num_added: self.num_added.0,
+        }
+    }
+
+    pub fn restore_state(
+        state: &QueueState,
+        maximum: u16,
+        memory: &GuestMemoryMmap,
+    ) -> std::io::Result<Self> {
+        if state.max_size != maximum {
+            return Err(std::io::Error::other("checkpoint queue capacity changed"));
+        }
+        let queue = Self {
+            max_size: state.max_size,
+            size: state.size,
+            ready: state.ready,
+            desc_table: GuestAddress(state.desc_table),
+            avail_ring: GuestAddress(state.avail_ring),
+            used_ring: GuestAddress(state.used_ring),
+            next_avail: Wrapping(state.next_avail),
+            next_used: Wrapping(state.next_used),
+            event_idx_enabled: state.event_idx_enabled,
+            num_added: Wrapping(state.num_added),
+        };
+        if queue.ready && !queue.is_valid(memory) {
+            return Err(std::io::Error::other("invalid checkpoint queue layout"));
+        }
+        Ok(queue)
+    }
+
     /// Constructs an empty virtio queue with the given `max_size`.
     pub fn new(max_size: u16) -> Queue {
         Queue {

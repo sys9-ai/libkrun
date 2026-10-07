@@ -22,6 +22,8 @@ aws-nitro = []
 test_utils = []
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["serde"] }
 bitflags = "1.2.0"
 crossbeam-channel = ">=0.5.15"
 libc = ">=0.2.39"

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 
 use super::super::Queue as VirtQueue;
 use super::muxer::{push_packet, MuxerRx, ProxyMap};
@@ -19,6 +20,8 @@ use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
 pub struct MuxerThread {
+    pub(super) stop: Arc<EventFd>,
+    initialized: bool,
     cid: u64,
     pub epoll: Epoll,
     rxq: Arc<Mutex<MuxerRxQ>>,
@@ -44,6 +47,8 @@ impl MuxerThread {
         unix_ipc_port_map: HashMap<u32, (PathBuf, bool)>,
     ) -> Self {
         MuxerThread {
+            stop: Arc::new(EventFd::new(EFD_NONBLOCK).expect("vsock stop eventfd")),
+            initialized: false,
             cid,
             epoll,
             rxq,
@@ -56,11 +61,11 @@ impl MuxerThread {
         }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> thread::JoinHandle<Self> {
         thread::Builder::new()
             .name("vsock muxer".into())
             .spawn(|| self.work())
-            .unwrap();
+            .unwrap()
     }
 
     fn send_credit_request(&self, credit_rx: MuxerRx) {
@@ -172,9 +177,21 @@ impl MuxerThread {
         }
     }
 
-    fn work(self) {
+    fn work(mut self) -> Self {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        if !self.initialized {
+            self.create_lisening_ipc_sockets();
+            // Proxy IDs always contain a nonzero ephemeral port. Zero is reserved
+            // for this worker's control event and cannot collide with a proxy.
+            self.epoll
+                .ctl(
+                    ControlOperation::Add,
+                    self.stop.as_raw_fd(),
+                    &EpollEvent::new(EventSet::IN, 0),
+                )
+                .unwrap();
+            self.initialized = true;
+        }
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
@@ -186,6 +203,10 @@ impl MuxerThread {
                         debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
+                        if id == 0 {
+                            let _ = self.stop.read();
+                            return self;
+                        }
 
                         let update = self.proxy_map.read().unwrap().get(&id).map(|proxy_lock| {
                             let mut proxy = proxy_lock.lock().unwrap();

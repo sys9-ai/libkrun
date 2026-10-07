@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::slice;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use utils::eventfd::EventFd;
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
@@ -2556,6 +2556,63 @@ pub unsafe extern "C" fn krun_set_kernel_console(ctx_id: u32, console_id: *const
     KRUN_SUCCESS
 }
 
+/// Configure a private local checkpoint transaction socket before starting the VM.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_checkpoint_socket(ctx_id: u32, path: *const c_char) -> i32 {
+    if path.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => return -libc::EINVAL,
+    };
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    context.vmr.checkpoint_socket = Some(path);
+    KRUN_SUCCESS
+}
+
+/// Restore a complete checkpoint with the caller's freshly configured host paths.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_restore_path(ctx_id: u32, path: *const c_char) -> i32 {
+    if path.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => return -libc::EINVAL,
+    };
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    context.vmr.restore_path = Some(path);
+    KRUN_SUCCESS
+}
+
+/// Notify a pre-bound host listener after checkpoint restoration.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[no_mangle]
+pub unsafe extern "C" fn krun_set_restore_ready_socket(ctx_id: u32, path: *const c_char) -> i32 {
+    if path.is_null() {
+        return -libc::EINVAL;
+    }
+    let path = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => return -libc::EINVAL,
+    };
+    let mut contexts = CTX_MAP.lock().unwrap();
+    let Some(context) = contexts.get_mut(&ctx_id) else {
+        return -libc::ENOENT;
+    };
+    context.vmr.restore_ready_socket = Some(path);
+    KRUN_SUCCESS
+}
+
 #[no_mangle]
 #[allow(unreachable_code)]
 pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
@@ -2728,6 +2785,17 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
 
     let (sender, _receiver) = unbounded();
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if (ctx_cfg.vmr.checkpoint_socket.is_some() || ctx_cfg.vmr.restore_path.is_some())
+        && (ctx_cfg.vmr.split_irqchip
+            || cfg!(feature = "tee")
+            || !ctx_cfg.vmr.serial_consoles.is_empty()
+            || ctx_cfg.vmr.firmware_config.is_some())
+    {
+        error!("Checkpoint control does not support this machine profile");
+        return -libc::EINVAL;
+    }
+
     let _vmm = match vmm::builder::build_microvm(
         &ctx_cfg.vmr,
         &mut event_manager,
@@ -2740,6 +2808,45 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             return -libc::EINVAL;
         }
     };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(path) = &ctx_cfg.vmr.checkpoint_socket {
+        let endpoint = match vmm::checkpoint::CheckpointEndpoint::bind(path, _vmm.clone()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                error!("Checkpoint control socket: {error}");
+                return -libc::EINVAL;
+            }
+        };
+        if let Err(error) = event_manager.add_subscriber(Arc::new(Mutex::new(endpoint))) {
+            error!("Checkpoint control event registration: {error:?}");
+            return -libc::EINVAL;
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if ctx_cfg.vmr.restore_path.is_some() {
+        let ready = match &ctx_cfg.vmr.restore_ready_socket {
+            Some(path) => match std::os::unix::net::UnixStream::connect(path) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    error!("Restore notification socket: {error}");
+                    return -libc::EINVAL;
+                }
+            },
+            None => None,
+        };
+        if let Err(error) = _vmm.lock().unwrap().resume_vcpus() {
+            error!("Resume restored VM: {error:?}");
+            return -libc::EINVAL;
+        }
+        if let Some(mut ready) = ready {
+            use std::io::Write;
+            if ready.write_all(b"R").is_err() {
+                return -libc::EIO;
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {

@@ -128,6 +128,11 @@ pub enum VsockConfig {
 /// held in the Vmm.
 #[derive(Default)]
 pub struct VmResources {
+    /// Persistent execution state to restore instead of cold boot.
+    pub restore_path: Option<PathBuf>,
+    /// Private local checkpoint control socket.
+    pub checkpoint_socket: Option<PathBuf>,
+    pub restore_ready_socket: Option<PathBuf>,
     /// The vCpu and memory configuration for this microVM.
     vm_config: VmConfig,
     /// The firmware to be loaded into the microVM.
@@ -408,6 +413,9 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            restore_path: None,
+            checkpoint_socket: None,
+            restore_ready_socket: None,
             vm_config: VmConfig::default(),
             firmware_config: None,
             kernel_cmdline: default_kernel_cmdline(),

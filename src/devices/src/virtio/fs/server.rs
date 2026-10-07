@@ -66,8 +66,8 @@ impl io::Write for ZCWriter<'_> {
 }
 
 pub struct Server<F: FileSystem + Sync> {
-    fs: F,
-    options: AtomicU64,
+    pub(super) fs: F,
+    pub(super) options: AtomicU64,
 }
 
 impl<F: FileSystem + Sync> Server<F> {

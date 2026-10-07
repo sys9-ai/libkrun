@@ -1055,3 +1055,134 @@ pub(crate) mod tests {
         assert_eq!(dummy_dev.acked_features(), 24);
     }
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TransportSnapshot {
+    device_type: u32,
+    avail_features: u64,
+    acked_features: u64,
+    features_select: u32,
+    acked_features_select: u32,
+    queue_select: u32,
+    device_status: u32,
+    config_generation: u32,
+    shm_region_select: u32,
+    interrupt_status: usize,
+    activated: bool,
+    device: DeviceSnapshot,
+}
+
+impl MmioTransport {
+    pub fn quiesce(&mut self) -> io::Result<()> {
+        let mut device = self.locked_device();
+        if device.is_activated() {
+            device.quiesce()?;
+        }
+        Ok(())
+    }
+
+    /// Called on the stopped event loop after every background worker has joined.
+    pub fn capture_state(&self, directory: &std::path::Path) -> io::Result<TransportSnapshot> {
+        let device = self.locked_device();
+        let activated = device.is_activated();
+        let state = if activated {
+            device.capture_state(directory)?
+        } else {
+            DeviceSnapshot {
+                queues: self
+                    .queues
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("missing inactive queues"))?
+                    .iter()
+                    .map(Queue::capture_state)
+                    .collect(),
+                payload: Vec::new(),
+            }
+        };
+        Ok(TransportSnapshot {
+            device_type: device.device_type(),
+            avail_features: device.avail_features(),
+            acked_features: device.acked_features(),
+            features_select: self.features_select,
+            acked_features_select: self.acked_features_select,
+            queue_select: self.queue_select,
+            device_status: self.device_status,
+            config_generation: self.config_generation,
+            shm_region_select: self.shm_region_select,
+            interrupt_status: self.interrupt.status().load(Ordering::SeqCst),
+            activated,
+            device: state,
+        })
+    }
+
+    pub fn restore_state(
+        &mut self,
+        state: TransportSnapshot,
+        directory: &std::path::Path,
+    ) -> io::Result<()> {
+        {
+            let device = self.locked_device();
+            if device.is_activated()
+                || state.device_type != device.device_type()
+                || state.avail_features != device.avail_features()
+                || state.acked_features & !device.avail_features() != 0
+                || state.device.queues.len() != self.queue_config.len()
+            {
+                return Err(io::Error::other(
+                    "checkpoint virtio device topology differs",
+                ));
+            }
+        }
+        let queues: Vec<Queue> = state
+            .device
+            .queues
+            .iter()
+            .zip(&self.queue_config)
+            .map(|(queue, config)| Queue::restore_state(queue, config.size, &self.mem))
+            .collect::<io::Result<_>>()?;
+        self.features_select = state.features_select;
+        self.acked_features_select = state.acked_features_select;
+        self.queue_select = state.queue_select;
+        self.device_status = state.device_status;
+        self.config_generation = state.config_generation;
+        self.shm_region_select = state.shm_region_select;
+        self.interrupt
+            .status()
+            .store(state.interrupt_status, Ordering::SeqCst);
+        let mut device = self.locked_device();
+        device.set_acked_features(state.acked_features);
+        if state.activated {
+            device.restore_state(&state.device.payload, directory)?;
+            let queues = queues
+                .into_iter()
+                .zip(self.queue_evts.iter().cloned())
+                .map(|(queue, event)| DeviceQueue::new(queue, event))
+                .collect();
+            device
+                .activate(self.mem.clone(), self.interrupt.clone(), queues)
+                .map_err(|e| io::Error::other(format!("checkpoint device activation: {e:?}")))?;
+            drop(device);
+            self.queues = None;
+            // Eventfd counters are host resources. Notify every restored queue so
+            // a guest notification captured before delivery cannot be lost.
+            for event in &self.queue_evts {
+                event.write(1)?;
+            }
+            if state.interrupt_status != 0 {
+                self.interrupt.event().write(1)?;
+            }
+        } else {
+            drop(device);
+            self.queues = Some(queues);
+        }
+        Ok(())
+    }
+
+    pub fn resume(&mut self) -> io::Result<()> {
+        let mut device = self.locked_device();
+        if device.is_activated() {
+            device.resume()?;
+        }
+        Ok(())
+    }
+}

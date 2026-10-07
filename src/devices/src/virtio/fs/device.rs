@@ -48,7 +48,9 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: passthrough::Config,
     read_only: bool,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Option<JoinHandle<FsWorker>>,
+    paused_worker: Option<FsWorker>,
+    restore_payload: Option<(Vec<u8>, std::path::PathBuf)>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -56,6 +58,11 @@ pub struct Fs {
 }
 
 impl Fs {
+    #[cfg(target_os = "linux")]
+    pub fn enable_checkpoint(&mut self) {
+        self.passthrough_cfg.checkpoint_enabled = true;
+    }
+
     pub fn new(
         fs_id: String,
         shared_dir: String,
@@ -85,6 +92,8 @@ impl Fs {
             passthrough_cfg: fs_cfg,
             read_only,
             worker_thread: None,
+            paused_worker: None,
+            restore_payload: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
             #[cfg(target_os = "macos")]
@@ -116,6 +125,48 @@ impl Fs {
 }
 
 impl VirtioDevice for Fs {
+    #[cfg(target_os = "linux")]
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        if let Some(worker) = self.worker_thread.take() {
+            self.worker_stopfd.write(1)?;
+            self.paused_worker = Some(
+                worker
+                    .join()
+                    .map_err(|_| std::io::Error::other("filesystem worker panicked"))?,
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_state(
+        &self,
+        directory: &std::path::Path,
+    ) -> std::io::Result<super::super::DeviceSnapshot> {
+        self.paused_worker
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("filesystem worker is not paused"))?
+            .capture_state(directory)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_state(
+        &mut self,
+        payload: &[u8],
+        directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.restore_payload = Some((payload.to_vec(), directory.to_path_buf()));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume(&mut self) -> std::io::Result<()> {
+        if let Some(worker) = self.paused_worker.take() {
+            self.worker_thread = Some(worker.run());
+        }
+        Ok(())
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -180,7 +231,7 @@ impl VirtioDevice for Fs {
             queue_evts.push(dq.event);
         }
 
-        let worker = FsWorker::new(
+        let mut worker = FsWorker::new(
             worker_queues,
             queue_evts,
             interrupt.clone(),
@@ -197,6 +248,13 @@ impl VirtioDevice for Fs {
             error!("virtio_fs: failed to create worker: {}", e);
             ActivateError::BadActivate
         })?;
+        #[cfg(target_os = "linux")]
+        if let Some((payload, directory)) = self.restore_payload.take() {
+            worker.restore_state(&payload, &directory).map_err(|e| {
+                error!("virtio_fs: checkpoint restore failed: {e}");
+                ActivateError::BadActivate
+            })?;
+        }
         self.worker_thread = Some(worker.run());
 
         self.device_state = DeviceState::Activated(mem, interrupt);
@@ -218,6 +276,8 @@ impl VirtioDevice for Fs {
                 error!("error waiting for worker thread: {e:?}");
             }
         }
+        self.paused_worker = None;
+        self.restore_payload = None;
         self.device_state = DeviceState::Inactive;
         true
     }

@@ -113,6 +113,41 @@ impl Balloon {
 }
 
 impl VirtioDevice for Balloon {
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn capture_state(
+        &self,
+        _directory: &std::path::Path,
+    ) -> std::io::Result<crate::virtio::DeviceSnapshot> {
+        let queues = self
+            .queues
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("device is inactive"))?;
+        Ok(crate::virtio::DeviceSnapshot {
+            queues: queues.iter().map(|dq| dq.queue.capture_state()).collect(),
+            payload: self.config.as_slice().to_vec(),
+        })
+    }
+
+    fn restore_state(
+        &mut self,
+        payload: &[u8],
+        _directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        if payload != self.config.as_slice() {
+            return Err(std::io::Error::other(
+                "invalid device checkpoint configuration",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resume(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }

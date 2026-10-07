@@ -62,6 +62,20 @@ pub struct ConsoleControl {
 }
 
 impl ConsoleControl {
+    pub(super) fn capture_state(&self) -> Vec<Vec<u8>> {
+        self.queue
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|payload| payload.to_vec())
+            .collect()
+    }
+
+    pub(super) fn restore_state(&self, messages: Vec<Vec<u8>>) -> std::io::Result<()> {
+        *self.queue.lock().unwrap() = messages.into_iter().map(Payload::Bytes).collect();
+        self.queue_evt.write(1)
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             queue: Default::default(),

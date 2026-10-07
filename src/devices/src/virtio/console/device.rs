@@ -53,6 +53,7 @@ impl VirtioConsoleConfig {
 }
 
 pub struct Console {
+    paused_ports: Vec<usize>,
     pub(crate) device_state: DeviceState,
     pub(crate) control: Arc<ConsoleControl>,
     pub(crate) ports: Vec<Port>,
@@ -96,6 +97,7 @@ impl Console {
             ports,
             queue_config,
             queues: Vec::new(),
+            paused_ports: Vec::new(),
             queue_events: Vec::new(),
             avail_features: AVAIL_FEATURES,
             acked_features: 0,
@@ -281,6 +283,96 @@ impl Console {
 }
 
 impl VirtioDevice for Console {
+    fn quiesce(&mut self) -> std::io::Result<()> {
+        for (id, port) in self.ports.iter_mut().enumerate() {
+            if let Some((rx, tx)) = port.quiesce()? {
+                let rx_index = port_id_to_queue_idx(QueueDirection::Rx, id);
+                let tx_index = port_id_to_queue_idx(QueueDirection::Tx, id);
+                self.queues[rx_index] =
+                    Some(DeviceQueue::new(rx, self.queue_events[rx_index].clone()));
+                self.queues[tx_index] =
+                    Some(DeviceQueue::new(tx, self.queue_events[tx_index].clone()));
+                self.paused_ports.push(id);
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_state(
+        &self,
+        _directory: &std::path::Path,
+    ) -> std::io::Result<crate::virtio::DeviceSnapshot> {
+        let queues = self
+            .queues
+            .iter()
+            .map(|queue| {
+                queue
+                    .as_ref()
+                    .map(|dq| dq.queue.capture_state())
+                    .ok_or_else(|| std::io::Error::other("console port is not quiesced"))
+            })
+            .collect::<std::io::Result<_>>()?;
+        let payload = bincode::serde::encode_to_vec(
+            (
+                &self.paused_ports,
+                self.control.capture_state(),
+                self.config.as_slice(),
+            ),
+            bincode::config::standard(),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(crate::virtio::DeviceSnapshot { queues, payload })
+    }
+
+    fn restore_state(
+        &mut self,
+        payload: &[u8],
+        _directory: &std::path::Path,
+    ) -> std::io::Result<()> {
+        let ((ports, messages, config), consumed): ((Vec<usize>, Vec<Vec<u8>>, Vec<u8>), usize) =
+            bincode::serde::decode_from_slice(
+                payload,
+                bincode::config::standard().with_limit::<1048576>(),
+            )
+            .map_err(std::io::Error::other)?;
+        if consumed != payload.len()
+            || config != self.config.as_slice()
+            || ports.iter().any(|id| *id >= self.ports.len())
+        {
+            return Err(std::io::Error::other(
+                "invalid console checkpoint configuration",
+            ));
+        }
+        let mut unique = ports.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != ports.len() {
+            return Err(std::io::Error::other("duplicate console port"));
+        }
+        self.paused_ports = ports;
+        self.control.restore_state(messages)
+    }
+
+    fn resume(&mut self) -> std::io::Result<()> {
+        let DeviceState::Activated(mem, interrupt) = &self.device_state else {
+            return Ok(());
+        };
+        for id in self.paused_ports.drain(..) {
+            let rx_index = port_id_to_queue_idx(QueueDirection::Rx, id);
+            let tx_index = port_id_to_queue_idx(QueueDirection::Tx, id);
+            let rx = self.queues[rx_index]
+                .take()
+                .ok_or_else(|| std::io::Error::other("console rx queue missing"))?
+                .queue;
+            let tx = self.queues[tx_index]
+                .take()
+                .ok_or_else(|| std::io::Error::other("console tx queue missing"))?
+                .queue;
+            self.ports[id].start(mem.clone(), rx, tx, interrupt.clone(), self.control.clone());
+        }
+        Ok(())
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -341,7 +433,10 @@ impl VirtioDevice for Console {
         self.queue_events = queues.iter().map(|dq| dq.event.clone()).collect();
         self.queues = queues.into_iter().map(Some).collect();
         self.device_state = DeviceState::Activated(mem, interrupt);
-
+        self.resume().map_err(|error| {
+            error!("console checkpoint restore: {error}");
+            ActivateError::BadActivate
+        })?;
         Ok(())
     }
 

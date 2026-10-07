@@ -15,6 +15,8 @@ extern crate log;
 
 /// Handles setup and initialization a `Vmm` object.
 pub mod builder;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod checkpoint;
 pub(crate) mod device_manager;
 /// Resource store for configured microVM resources.
 pub mod resources;
@@ -87,6 +89,7 @@ pub const FC_EXIT_CODE_ARG_PARSING: u8 = 153;
 /// have permissions to open the KVM fd).
 #[derive(Debug)]
 pub enum Error {
+    Checkpoint(io::Error),
     /// This error is thrown by the minimal boot loader implementation.
     ConfigureSystem(arch::Error),
     /// Legacy devices work with Event file descriptors and the creation can fail because
@@ -142,6 +145,7 @@ impl Display for Error {
         use self::Error::*;
 
         match self {
+            Checkpoint(e) => write!(f, "Checkpoint error: {e}"),
             ConfigureSystem(e) => write!(f, "System configuration error: {e:?}"),
             #[cfg(target_arch = "x86_64")]
             CreateLegacyDevice(e) => write!(f, "Error creating legacy device: {e:?}"),
@@ -200,6 +204,8 @@ pub struct Vmm {
     kernel_cmdline: KernelCmdline,
 
     vcpus_handles: Vec<VcpuHandle>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    checkpoint_control: checkpoint::CheckpointControl,
     exit_evt: EventFd,
     vm: Vm,
     exit_observers: Vec<Arc<Mutex<dyn VmmExitObserver>>>,
@@ -222,7 +228,12 @@ impl Vmm {
     }
 
     /// Starts the microVM vcpus.
-    pub fn start_vcpus(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+    pub fn start_vcpus(&mut self, vcpus: Vec<Vcpu>) -> Result<()> {
+        self.start_vcpus_paused(vcpus)?;
+        self.resume_vcpus()
+    }
+
+    pub fn start_vcpus_paused(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
         let vcpu_count = vcpus.len();
 
         Vcpu::register_kick_signal_handler();
@@ -236,8 +247,7 @@ impl Vmm {
                 .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
         }
 
-        // The vcpus start off in the `Paused` state, let them run.
-        self.resume_vcpus()?;
+        // Restore may populate execution state before releasing these threads.
 
         Ok(())
     }
@@ -245,19 +255,30 @@ impl Vmm {
     /// Sends a resume command to the vcpus.
     #[cfg(target_os = "linux")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if self.checkpoint_control.failed {
+            return Err(Error::VcpuResume);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.checkpoint_control.failed = true;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
         for handle in self.vcpus_handles.iter() {
             handle
                 .send_event(VcpuEvent::Resume)
                 .map_err(Error::VcpuEvent)?;
         }
         for handle in self.vcpus_handles.iter() {
-            match handle
-                .response_receiver()
-                .recv_timeout(Duration::from_millis(1000))
-            {
+            match handle.response_receiver().recv_deadline(deadline) {
                 Ok(VcpuResponse::Resumed) => (),
                 _ => return Err(Error::VcpuResume),
             }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.checkpoint_control.failed = false;
+            self.checkpoint_control.paused = false;
         }
         Ok(())
     }
