@@ -1128,7 +1128,6 @@ fn list_host_xattrs(target: &FileOrLink) -> io::Result<Vec<u8>> {
 
 impl PassthroughFs {
     pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
-        let fd_budget = FdBudget::process()?;
         let fd = if let Some(fd) = cfg.proc_sfd_rawfd {
             fd
         } else {
@@ -1149,6 +1148,9 @@ impl PassthroughFs {
 
             fd
         };
+        // Take ownership before further fallible setup, including budget probing.
+        let proc_self_fd = unsafe { File::from_raw_fd(fd) };
+        let fd_budget = FdBudget::process(&proc_self_fd)?;
 
         let my_uid = if has_cap(None, CapSet::Effective, Capability::CAP_SETUID).unwrap_or_default()
         {
@@ -1168,9 +1170,6 @@ impl PassthroughFs {
 
         let cap_fowner =
             has_cap(None, CapSet::Effective, Capability::CAP_FOWNER).unwrap_or_default();
-
-        // Safe because we just opened this fd or it was provided by our caller.
-        let proc_self_fd = unsafe { File::from_raw_fd(fd) };
 
         Ok(PassthroughFs {
             fd_budget,

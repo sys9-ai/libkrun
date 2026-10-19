@@ -1,6 +1,52 @@
 use super::*;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+
+#[test]
+fn fd_budget_preopened_proc_survives_chroot() {
+    if !in_child(concat!(
+        module_path!(),
+        "::fd_budget_preopened_proc_survives_chroot"
+    )) {
+        return;
+    }
+    use std::os::fd::IntoRawFd;
+    let root = std::env::temp_dir().join(format!("krun-fd-chroot-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let original_root = File::open("/").unwrap();
+    let proc = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY)
+        .open("/proc/self/fd")
+        .unwrap();
+    let path = CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+    // Run this subprocess test with CAP_SYS_CHROOT (for example in Docker).
+    let status = unsafe { libc::chroot(path.as_ptr()) };
+    if status != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        eprintln!("chroot regression requires CAP_SYS_CHROOT");
+        std::fs::remove_dir(root).unwrap();
+        return;
+    }
+    assert_eq!(status, 0);
+    std::env::set_current_dir("/").unwrap();
+    assert!(!PathBuf::from("/proc/self/fd").exists());
+    let restored = PassthroughFs::new(Config {
+        root_dir: "/".into(),
+        proc_sfd_rawfd: Some(proc.into_raw_fd()),
+        ..Default::default()
+    });
+    // Restore the child's root before assertions, so failure still cleans up.
+    assert_eq!(unsafe { libc::fchdir(original_root.as_raw_fd()) }, 0);
+    assert_eq!(unsafe { libc::chroot(c".".as_ptr()) }, 0);
+    std::env::set_current_dir("/").unwrap();
+    std::fs::remove_dir(root).unwrap();
+    assert!(
+        restored.is_ok(),
+        "preopened proc directory rejected: {:?}",
+        restored.err()
+    );
+}
 
 // RLIMIT is process-wide. Every test runs in its own subprocess, including when
 // the parent test runner executes unrelated filesystem tests concurrently.
@@ -329,5 +375,38 @@ fn fd_budget_checkpoint_restore_reacquires_permits() {
     assert_eq!(other.do_getattr(inode).unwrap().0.st_size, 11);
     fs.destroy();
     other.destroy();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fd_budget_checkpoint_roundtrip_at_capacity() {
+    if !in_child(concat!(
+        module_path!(),
+        "::fd_budget_checkpoint_roundtrip_at_capacity"
+    )) {
+        return;
+    }
+    let (root, fs, restored) = fixture(256);
+    restored.destroy();
+    let inode = fs.do_lookup(fuse::ROOT_ID, c"f0").unwrap().inode;
+    let (handle, _) = fs.do_open(inode, false, libc::O_RDWR as u32).unwrap();
+    std::fs::remove_file(root.join("f0")).unwrap();
+    exhaust(&fs, 1);
+    let payloads = root.join("payloads");
+    std::fs::create_dir(&payloads).unwrap();
+    let state = fs.capture_state(&payloads).unwrap();
+    fs.destroy();
+    restored.restore_state(state, &payloads).unwrap();
+    let handles = restored.handles.read().unwrap();
+    let file = handles.get(&handle.unwrap()).unwrap().file.read().unwrap();
+    let mut body = [0; 11];
+    assert_eq!(
+        std::os::unix::fs::FileExt::read_at(&**file, &mut body, 0).unwrap(),
+        11
+    );
+    assert_eq!(&body, b"preserve-me");
+    drop(file);
+    drop(handles);
+    restored.destroy();
     std::fs::remove_dir_all(root).unwrap();
 }

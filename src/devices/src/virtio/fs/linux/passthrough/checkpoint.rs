@@ -270,7 +270,7 @@ impl PassthroughFs {
         // O_PATH pins a kernel dentry but does not issue FUSE_OPEN. Keep a real
         // open reference until guest handles have been reopened; otherwise a
         // FUSE server may reclaim the unlinked inode when `output` closes.
-        let mut unlinked_files = Vec::new();
+        let mut unlinked_files = BTreeMap::new();
         for saved in state.inodes {
             if saved.inode == 0
                 || saved.inode >= state.next_inode
@@ -357,7 +357,7 @@ impl PassthroughFs {
                     if unsafe { libc::futimens(output.as_raw_fd(), times.as_ptr()) } < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    unlinked_files.push(pin_permit.attach(output));
+                    unlinked_files.insert(saved.inode, pin_permit.attach(output));
                     pinned
                 }
             };
@@ -412,8 +412,14 @@ impl PassthroughFs {
             {
                 return Err(io::Error::other("destructive open flags in checkpoint"));
             }
-            let permit = self.fd_budget.acquire()?;
-            let file = permit.attach(self.open_inode(saved.inode, saved.flags)?);
+            let file = if let Some(pin) = unlinked_files.remove(&saved.inode) {
+                // Keep the FUSE_OPEN pin alive until its first guest handle is
+                // open, then reuse that retained slot instead of charging both.
+                pin.replace_file(self.open_inode(saved.inode, saved.flags)?)
+            } else {
+                let permit = self.fd_budget.acquire()?;
+                permit.attach(self.open_inode(saved.inode, saved.flags)?)
+            };
             handles.insert(
                 saved.handle,
                 Arc::new(HandleData {

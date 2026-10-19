@@ -5,6 +5,7 @@
 //! This protects against guest filesystem growth; it does not bound arbitrary
 //! growth in other VMM subsystems or survive lowering RLIMIT below current usage.
 
+use nix::{dir::Dir, fcntl::OFlag, sys::stat::Mode};
 use std::fs::File;
 use std::io;
 use std::ops::Deref;
@@ -22,15 +23,25 @@ pub(super) struct FdBudget {
 }
 
 impl FdBudget {
-    pub(super) fn process() -> io::Result<Arc<Self>> {
+    pub(super) fn process(proc_self_fd: &File) -> io::Result<Arc<Self>> {
         let mut shared = PROCESS_BUDGET.lock().unwrap();
         if let Some(budget) = shared.as_ref() {
             return Ok(Arc::clone(budget));
         }
-        // Includes read_dir's temporary descriptor, conservatively overcounting
-        // by one. Initialize before any guest-retained descriptors are allocated.
-        let baseline = std::fs::read_dir("/proc/self/fd")?
-            .try_fold(0, |count, entry| entry.map(|_| count + 1))?;
+        // Reopen through the caller's proc directory: sandboxing may have hidden
+        // the absolute path. Includes this temporary descriptor in the baseline.
+        let mut directory = Dir::openat(
+            proc_self_fd,
+            ".",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let baseline = directory.iter().try_fold(0, |count, entry| {
+            let entry = entry?;
+            Ok::<_, nix::errno::Errno>(
+                count + usize::from(!matches!(entry.file_name().to_bytes(), b"." | b"..")),
+            )
+        })?;
         let budget = Arc::new(Self {
             baseline,
             used: AtomicUsize::new(0),
@@ -84,6 +95,15 @@ pub(super) struct GuestFile {
     // Rust drops fields in declaration order: close before returning the permit.
     file: File,
     _permit: FdPermit,
+}
+
+impl GuestFile {
+    // The replacement is opened from the transient reserve while this file
+    // still pins its inode. Closing it transfers its retained slot to the new FD.
+    pub(super) fn replace_file(mut self, file: File) -> Self {
+        self.file = file;
+        self
+    }
 }
 
 impl Deref for GuestFile {

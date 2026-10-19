@@ -12,7 +12,8 @@ mount; changing the guest kernel is not part of this implementation.
 
 ## Ownership and capacity
 
-The first Linux passthrough backend records the already-open process descriptors.
+The first Linux passthrough backend records the already-open process descriptors
+through its proc directory descriptor, including one supplied before sandboxing.
 Each allocation reads the current soft `RLIMIT_NOFILE`. From the slots remaining
 after that baseline, it reserves the smaller of 1024 or half the remaining slots
 for transient operations and later VMM activity. All shares use the same atomic
@@ -20,7 +21,9 @@ permit counter. File close precedes permit release, including delayed Arc drops.
 
 Retained inode descriptors, open handles, exported duplicates, and descriptors
 reopened during checkpoint restore are charged. Restore also charges temporary
-unlinked-file pins that live across multiple reopen operations. The checkpoint
+unlinked-file pins that live across multiple reopen operations. The first restored
+handle of an unlinked inode takes over its pin and permit, avoiding a second
+retained charge for the same handoff. The checkpoint
 format does not store a budget; the target process acquires new permits.
 
 Open with truncation and create reserve before changing the host file. Creation
@@ -44,9 +47,11 @@ error classification and production rollout are separate work.
 
 ## Verification
 
-On Linux, `make test-fd-budget` runs five subprocess-isolated RLIMIT tests:
+On Linux, `make test-fd-budget` runs seven subprocess-isolated tests:
 revalidation and FORGET/RELEASE recovery, concurrent shares, low and changing
-limits, exported descriptor release, and checkpoint restore accounting.
+limits, exported descriptor release, checkpoint restore accounting, same-limit restoration at capacity, and a
+preopened proc directory after chroot. The last test requires CAP_SYS_CHROOT;
+run it as root in Docker to exercise that boundary.
 `make test-fs` also covers the existing passthrough and checkpoint tests.
 
 The regression tests use production PassthroughFs operations. Run them on the
