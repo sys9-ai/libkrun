@@ -12,7 +12,9 @@ use std::mem::{self, size_of, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+use super::fd_budget::{FdBudget, FdPermit, GuestFile};
 use std::time::Duration;
 
 use caps::{has_cap, CapSet, Capability};
@@ -38,6 +40,8 @@ const UID_MAX: u32 = u32::MAX - 1;
 static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 
 pub mod checkpoint;
+#[cfg(test)]
+mod fd_budget_tests;
 
 type Inode = u64;
 type Handle = u64;
@@ -54,7 +58,7 @@ struct InodeData {
     // Guest stat identity survives reopening on a different host filesystem.
     guest_ino: u64,
     // Most of these aren't actually files but ¯\_(ツ)_/¯.
-    file: File,
+    file: GuestFile,
     dev: u64,
     mnt_id: u64,
     refcount: AtomicU64,
@@ -62,8 +66,8 @@ struct InodeData {
 
 struct HandleData {
     inode: Inode,
-    file: RwLock<File>,
-    exported: AtomicBool,
+    file: RwLock<GuestFile>,
+    exported: Mutex<Option<FdPermit>>,
     directory: RwLock<Option<Vec<checkpoint::DirectoryEntry>>>,
 }
 
@@ -1050,6 +1054,7 @@ impl Default for Config {
 /// directory ends up as the root of the file system process. One way to accomplish this is via a
 /// combination of mount namespaces and the pivot_root system call.
 pub struct PassthroughFs {
+    fd_budget: Arc<FdBudget>,
     // File descriptors for various points in the file system tree. These fds are always opened with
     // the `O_PATH` option so they cannot be used for reading or writing any data. See the
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
@@ -1123,6 +1128,7 @@ fn list_host_xattrs(target: &FileOrLink) -> io::Result<Vec<u8>> {
 
 impl PassthroughFs {
     pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
+        let fd_budget = FdBudget::process()?;
         let fd = if let Some(fd) = cfg.proc_sfd_rawfd {
             fd
         } else {
@@ -1167,6 +1173,7 @@ impl PassthroughFs {
         let proc_self_fd = unsafe { File::from_raw_fd(fd) };
 
         Ok(PassthroughFs {
+            fd_budget,
             inodes: RwLock::new(MultikeyBTreeMap::new()),
             next_inode: AtomicU64::new(fuse::ROOT_ID + 2),
             init_inode: fuse::ROOT_ID + 1,
@@ -1257,6 +1264,15 @@ impl PassthroughFs {
     }
 
     fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        self.do_lookup_reserved(parent, name, None)
+    }
+
+    fn do_lookup_reserved(
+        &self,
+        parent: Inode,
+        name: &CStr,
+        permit: Option<FdPermit>,
+    ) -> io::Result<Entry> {
         let p = self
             .inodes
             .read()
@@ -1306,6 +1322,10 @@ impl PassthroughFs {
             attr.st_ino = data.guest_ino;
             data.inode
         } else {
+            let permit = match permit {
+                Some(permit) => permit,
+                None => self.fd_budget.acquire()?,
+            };
             // There is a possible race here where 2 threads end up adding the same file
             // into the inode list.  However, since each of those will get a unique Inode
             // value and unique file descriptors this shouldn't be that much of a problem.
@@ -1320,7 +1340,7 @@ impl PassthroughFs {
                 Arc::new(InodeData {
                     inode,
                     guest_ino: st.st_ino,
-                    file: f,
+                    file: permit.attach(f),
                     dev: st.st_dev,
                     mnt_id,
                     refcount: AtomicU64::new(1),
@@ -1494,13 +1514,14 @@ impl PassthroughFs {
             flags &= !(libc::O_NOATIME as u32);
         }
 
+        let permit = self.fd_budget.acquire()?;
         let file = {
             let _killpriv_guard = if kill_priv {
                 drop_effective_cap(Capability::CAP_FSETID)?
             } else {
                 None
             };
-            RwLock::new(self.open_inode(inode, flags as i32)?)
+            RwLock::new(permit.attach(self.open_inode(inode, flags as i32)?))
         };
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -1538,7 +1559,7 @@ impl PassthroughFs {
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
             if e.get().inode == inode {
-                if e.get().exported.load(Ordering::Relaxed) {
+                if e.get().exported.lock().unwrap().is_some() {
                     self.cfg
                         .export_table
                         .as_ref()
@@ -1701,6 +1722,7 @@ impl FileSystem for PassthroughFs {
     type Handle = Handle;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        let permit = self.fd_budget.acquire()?;
         let root = CString::new(self.cfg.root_dir.as_str()).expect("CString::new failed");
 
         // Safe because this doesn't modify any memory and we check the return value.
@@ -1740,7 +1762,7 @@ impl FileSystem for PassthroughFs {
             Arc::new(InodeData {
                 inode: fuse::ROOT_ID,
                 guest_ino: st.st_ino,
-                file: f,
+                file: permit.attach(f),
                 dev: st.st_dev,
                 mnt_id,
                 refcount: AtomicU64::new(2),
@@ -1767,7 +1789,16 @@ impl FileSystem for PassthroughFs {
     }
 
     fn destroy(&self) {
-        self.handles.write().unwrap().clear();
+        let mut handles = self.handles.write().unwrap();
+        // Exported duplicates must close before their handle-owned permits drop.
+        if let Some(exports) = &self.cfg.export_table {
+            exports
+                .lock()
+                .unwrap()
+                .retain(|(fsid, _), _| *fsid != self.cfg.export_fsid);
+        }
+        handles.clear();
+        drop(handles);
         self.inodes.write().unwrap().clear();
         self.supplementary_group_extension
             .store(false, Ordering::Relaxed);
@@ -1863,6 +1894,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
+        let inode_permit = self.fd_budget.acquire()?;
         let (guest_gid, inherits_group) = self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
@@ -1882,7 +1914,7 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), create_mode | 0o700) };
         if res == 0 {
-            let entry = self.do_lookup(parent, name)?;
+            let entry = self.do_lookup_reserved(parent, name, Some(inode_permit))?;
             self.set_guest_metadata(entry.inode, ctx.uid, guest_gid, Some(create_mode))?;
             self.refresh_entry_attr(entry)
         } else {
@@ -1971,6 +2003,9 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
+        // Reserve both retained descriptors before creating or truncating a file.
+        let handle_permit = self.fd_budget.acquire()?;
+        let inode_permit = self.fd_budget.acquire()?;
         let (guest_gid, _) = self.prepare_create(&ctx, parent, &extensions)?;
         let _killpriv_guard = if kill_priv {
             drop_effective_cap(Capability::CAP_FSETID)?
@@ -2017,9 +2052,9 @@ impl FileSystem for PassthroughFs {
         }
 
         // Safe because we just opened this fd.
-        let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
+        let file = RwLock::new(handle_permit.attach(unsafe { File::from_raw_fd(fd) }));
 
-        let entry = self.do_lookup(parent, name)?;
+        let entry = self.do_lookup_reserved(parent, name, Some(inode_permit))?;
         if created {
             self.set_guest_metadata(
                 entry.inode,
@@ -2354,6 +2389,8 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
+        // Reserve before creating a new inode.
+        let inode_permit = self.fd_budget.acquire()?;
         let (guest_gid, _) = self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
@@ -2382,7 +2419,7 @@ impl FileSystem for PassthroughFs {
         if res < 0 {
             Err(io::Error::last_os_error())
         } else {
-            let entry = self.do_lookup(parent, name)?;
+            let entry = self.do_lookup_reserved(parent, name, Some(inode_permit))?;
             // Native root-owned special inodes need no ownership override.
             // Non-root owners use the filesystem's system namespace instead.
             if mode & libc::S_IFMT != libc::S_IFREG
@@ -2451,6 +2488,7 @@ impl FileSystem for PassthroughFs {
             unimplemented!("SECURITY_CTX is not supported and should not be used by the guest");
         }
 
+        let inode_permit = self.fd_budget.acquire()?;
         self.prepare_create(&ctx, parent, &extensions)?;
         let data = self
             .inodes
@@ -2464,7 +2502,7 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
-            let entry = self.do_lookup(parent, name)?;
+            let entry = self.do_lookup_reserved(parent, name, Some(inode_permit))?;
             self.refresh_entry_attr(entry)
         } else {
             Err(io::Error::last_os_error())
@@ -2994,6 +3032,12 @@ impl FileSystem for PassthroughFs {
                     return Err(einval());
                 }
 
+                let handles = self.handles.read().unwrap();
+                let data = handles
+                    .get(&handle)
+                    .filter(|hd| hd.inode == inode)
+                    .ok_or_else(ebadf)?;
+
                 let mut exports = self
                     .cfg
                     .export_table
@@ -3002,17 +3046,10 @@ impl FileSystem for PassthroughFs {
                     .lock()
                     .unwrap();
 
-                let handles = self.handles.read().unwrap();
-                let data = handles
-                    .get(&handle)
-                    .filter(|hd| hd.inode == inode)
-                    .ok_or_else(ebadf)?;
-
-                data.exported.store(true, Ordering::Relaxed);
-
+                let permit = self.fd_budget.acquire()?;
                 let fd = data.file.read().unwrap().try_clone()?;
-
                 exports.insert((self.cfg.export_fsid, handle), fd);
+                *data.exported.lock().unwrap() = Some(permit);
 
                 let mut ret: Vec<_> = self.cfg.export_fsid.to_ne_bytes().into();
                 ret.extend_from_slice(&handle.to_ne_bytes());
@@ -3030,5 +3067,11 @@ impl FileSystem for PassthroughFs {
             // optional file-attribute support; EOPNOTSUPP aborts copy-up.
             _ => Err(io::Error::from_raw_os_error(libc::ENOTTY)),
         }
+    }
+}
+
+impl Drop for PassthroughFs {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }

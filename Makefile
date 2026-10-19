@@ -273,3 +273,11 @@ EXTRA_LIBPATH_Darwin = /opt/homebrew/opt/libkrunfw/lib:/opt/homebrew/opt/llvm/li
 # so we pass the path via LIBKRUN_LIB_PATH and let run.sh set the real variable.
 test: test-prefix
 	cd tests; RUST_LOG=trace LIBKRUN_LIB_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/):$(EXTRA_LIBPATH_$(OS))" PKG_CONFIG_PATH="$$(realpath ../test-prefix/$(LIBDIR_$(OS))/pkgconfig/)" ./run.sh test --test-case "$(TEST)" $(TEST_FLAGS)
+
+.PHONY: test-fd-budget
+test-fd-budget:
+	cargo test -p krun-devices --lib fd_budget -- --nocapture
+
+.PHONY: test-fs
+test-fs:
+	cargo test -p krun-devices --lib virtio::fs::linux::passthrough -- --nocapture

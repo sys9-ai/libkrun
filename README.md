@@ -206,6 +206,8 @@ sudo make [FEATURE_OPTIONS] install
 
 ## Using the library
 
+Linux virtiofs enforces a [process-wide descriptor budget](docs/fd-budget.md).
+
 Despite being written in Rust, this library provides a simple C API defined in [include/libkrun.h](include/libkrun.h)
 
 ## Examples

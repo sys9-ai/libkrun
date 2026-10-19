@@ -1,0 +1,61 @@
+# Linux virtiofs descriptor budget
+
+Guest-cached inodes and open files share a process-wide host descriptor budget.
+New retained descriptors return `ENFILE` before filesystem-driven growth consumes
+all of `RLIMIT_NOFILE`. Existing inode lookup still opens and checks a temporary
+O_PATH descriptor, but does not need another retained-descriptor permit.
+
+This distinction matters for mount ancestors. If host `openat` fails with EMFILE
+during revalidation, Linux 6.12.76 FUSE can invalidate the ancestor dentry and
+VFS can detach its descendant mounts. Preventing that host failure preserves the
+mount; changing the guest kernel is not part of this implementation.
+
+## Ownership and capacity
+
+The first Linux passthrough backend records the already-open process descriptors.
+Each allocation reads the current soft `RLIMIT_NOFILE`. From the slots remaining
+after that baseline, it reserves the smaller of 1024 or half the remaining slots
+for transient operations and later VMM activity. All shares use the same atomic
+permit counter. File close precedes permit release, including delayed Arc drops.
+
+Retained inode descriptors, open handles, exported duplicates, and descriptors
+reopened during checkpoint restore are charged. Restore also charges temporary
+unlinked-file pins that live across multiple reopen operations. The checkpoint
+format does not store a budget; the target process acquires new permits.
+
+Open with truncation and create reserve before changing the host file. Creation
+reserves both a possible new inode and its open handle. Lookup of an already
+known inode releases an unused reservation. FORGET, RELEASE, backend destruction,
+and failed allocations return their permits.
+
+## Bounds
+
+This bounds guest filesystem retention, not arbitrary descriptor growth in other
+VMM subsystems. The reserve is finite, and a host administrator must not lower
+RLIMIT below current actual usage plus the space needed by concurrent operations.
+A process-global budget must be initialized after the embedding application's
+fork/exec boundary; BoxLite constructs these backends in its executed shim.
+
+At the budget boundary, new opens can fail even for already-known files. For
+example, SQLite may temporarily report CANTOPEN when it cannot open its journal.
+The budget does not make an overloaded workload succeed. Once capacity returns,
+operations can resume on the preserved mount without recreating the VM. Product
+error classification and production rollout are separate work.
+
+## Verification
+
+On Linux, `make test-fd-budget` runs five subprocess-isolated RLIMIT tests:
+revalidation and FORGET/RELEASE recovery, concurrent shares, low and changing
+limits, exported descriptor release, and checkpoint restore accounting.
+`make test-fs` also covers the existing passthrough and checkpoint tests.
+
+The regression tests use production PassthroughFs operations. Run them on the
+unmodified base with only the test module added, then with the complete fix.
+The real-VM experiment separately checks mountinfo, device/inode identity, SQLite
+writes, host descriptor counts, and guest/host syscall traces under the same
+immutable guest kernel. Its results are owned by the integrating BoxLite
+investigation record.
+
+The allocation/revalidation separation follows the approach in
+[virtiofsd merge request 262](https://gitlab.com/virtio-fs/virtiofsd/-/merge_requests/262).
+This is an adaptation for libkrun's inode and handle ownership, not a direct port.

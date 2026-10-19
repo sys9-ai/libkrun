@@ -224,7 +224,7 @@ impl PassthroughFs {
         }
         let mut handles = Vec::new();
         for (&handle, data) in self.handles.read().unwrap().iter() {
-            if data.exported.load(Ordering::Relaxed) {
+            if data.exported.lock().unwrap().is_some() {
                 return Err(io::Error::other(
                     "exported filesystem handles cannot be checkpointed",
                 ));
@@ -278,6 +278,7 @@ impl PassthroughFs {
             {
                 return Err(io::Error::other("invalid checkpoint inode identity"));
             }
+            let permit = self.fd_budget.acquire()?;
             let file = match &saved.location {
                 InodeLocation::Path(path) => open_beneath(&root, path)?,
                 InodeLocation::Unlinked {
@@ -289,6 +290,7 @@ impl PassthroughFs {
                     mtime,
                     xattrs,
                 } => {
+                    let pin_permit = self.fd_budget.acquire()?;
                     let is_directory = saved.kind == libc::S_IFDIR;
                     let temporary = format!(".krun-restore-{}-{}", std::process::id(), saved.inode);
                     let path = Path::new(&self.cfg.root_dir).join(&temporary);
@@ -355,7 +357,7 @@ impl PassthroughFs {
                     if unsafe { libc::futimens(output.as_raw_fd(), times.as_ptr()) } < 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    unlinked_files.push(output);
+                    unlinked_files.push(pin_permit.attach(output));
                     pinned
                 }
             };
@@ -379,7 +381,7 @@ impl PassthroughFs {
                 Arc::new(InodeData {
                     inode: saved.inode,
                     guest_ino: saved.guest_ino,
-                    file,
+                    file: permit.attach(file),
                     dev: st.st_dev,
                     mnt_id,
                     refcount: AtomicU64::new(saved.refcount),
@@ -410,13 +412,14 @@ impl PassthroughFs {
             {
                 return Err(io::Error::other("destructive open flags in checkpoint"));
             }
-            let file = self.open_inode(saved.inode, saved.flags)?;
+            let permit = self.fd_budget.acquire()?;
+            let file = permit.attach(self.open_inode(saved.inode, saved.flags)?);
             handles.insert(
                 saved.handle,
                 Arc::new(HandleData {
                     inode: saved.inode,
                     file: RwLock::new(file),
-                    exported: AtomicBool::new(false),
+                    exported: Default::default(),
                     directory: RwLock::new(saved.directory),
                 }),
             );
@@ -541,17 +544,12 @@ mod tests {
         .unwrap();
         restored.restore_state(state, &payloads).unwrap();
         let mut body = String::new();
-        restored
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .unwrap()
-            .file
-            .write()
-            .unwrap()
-            .read_to_string(&mut body)
-            .unwrap();
+        {
+            let handles = restored.handles.read().unwrap();
+            let file = handles.get(&handle).unwrap().file.write().unwrap();
+            let mut file: &File = &file;
+            file.read_to_string(&mut body).unwrap();
+        }
         assert_eq!(body, "initialized state");
         assert_eq!(restored.do_getattr(inode).unwrap().0.st_ino, original_ino);
         assert_eq!(
