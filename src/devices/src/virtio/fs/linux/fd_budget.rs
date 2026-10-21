@@ -4,13 +4,19 @@
 //! existing inode uses a temporary descriptor from the reserve, not a new permit.
 //! This protects against guest filesystem growth; it does not bound arbitrary
 //! growth in other VMM subsystems or survive lowering RLIMIT below current usage.
+//!
+//! Retained descriptors follow the guest's inode cache, not its working set: a
+//! guest with spare memory keeps every inode it has seen. Once half the budget
+//! is retained, the embedding process is told to have the guest drop unused
+//! inodes, whose FORGET requests then return their descriptors.
 
 use nix::{dir::Dir, fcntl::OFlag, sys::stat::Mode};
 use std::fs::File;
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 // Covers concurrent temporary filesystem operations and post-init VMM activity.
 // Non-filesystem descriptors already open at initialization are charged separately.
@@ -20,6 +26,39 @@ static PROCESS_BUDGET: Mutex<Option<Arc<FdBudget>>> = Mutex::new(None);
 pub(super) struct FdBudget {
     baseline: usize,
     used: AtomicUsize,
+    // Guards the pressure check against a concurrent crossing notification.
+    pressure_lock: Mutex<()>,
+    pressure: Condvar,
+}
+
+/// Descriptors retained for guest inodes and open files, and their current budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorUsage {
+    pub used: usize,
+    pub capacity: usize,
+}
+
+impl DescriptorUsage {
+    /// The guest should drop unused inodes at half the budget, leaving the
+    /// other half for growth while its FORGET requests arrive.
+    pub fn needs_reclaim(&self) -> bool {
+        self.used.saturating_mul(2) >= self.capacity
+    }
+}
+
+fn process_budget() -> Option<Arc<FdBudget>> {
+    PROCESS_BUDGET.lock().unwrap().clone()
+}
+
+/// Current usage, or `None` before the first passthrough share is created.
+pub fn descriptor_usage() -> Option<io::Result<DescriptorUsage>> {
+    process_budget().map(|budget| budget.usage())
+}
+
+/// Waits up to `timeout` for usage to need reclaim. Returns `None` before the
+/// first passthrough share is created.
+pub fn wait_descriptor_pressure(timeout: Duration) -> Option<io::Result<bool>> {
+    process_budget().map(|budget| budget.wait_pressure(timeout))
 }
 
 impl FdBudget {
@@ -45,12 +84,14 @@ impl FdBudget {
         let budget = Arc::new(Self {
             baseline,
             used: AtomicUsize::new(0),
+            pressure_lock: Mutex::new(()),
+            pressure: Condvar::new(),
         });
         *shared = Some(Arc::clone(&budget));
         Ok(budget)
     }
 
-    pub(super) fn acquire(self: &Arc<Self>) -> io::Result<FdPermit> {
+    fn capacity(&self) -> io::Result<usize> {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -64,13 +105,40 @@ impl FdBudget {
         // Small limits must still allow boot and a small working set. Preserve
         // half the remaining table until the full 1024-descriptor reserve fits.
         let reserve = MAX_INTERNAL_RESERVE.min(available / 2);
-        let capacity = available - reserve;
-        self.used
+        Ok(available - reserve)
+    }
+
+    fn usage(&self) -> io::Result<DescriptorUsage> {
+        Ok(DescriptorUsage {
+            used: self.used.load(Ordering::Acquire),
+            capacity: self.capacity()?,
+        })
+    }
+
+    pub(super) fn acquire(self: &Arc<Self>) -> io::Result<FdPermit> {
+        let capacity = self.capacity()?;
+        let previous = self
+            .used
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 (used < capacity).then_some(used + 1)
             })
             .map_err(|_| io::Error::from_raw_os_error(libc::ENFILE))?;
+        let crossed = |used: usize| DescriptorUsage { used, capacity }.needs_reclaim();
+        if !crossed(previous) && crossed(previous + 1) {
+            let _guard = self.pressure_lock.lock().unwrap();
+            self.pressure.notify_all();
+        }
         Ok(FdPermit(Arc::clone(self)))
+    }
+
+    fn wait_pressure(&self, timeout: Duration) -> io::Result<bool> {
+        let guard = self.pressure_lock.lock().unwrap();
+        if self.usage()?.needs_reclaim() {
+            return Ok(true);
+        }
+        // The timeout also picks up capacity changes from a new RLIMIT.
+        let _guard = self.pressure.wait_timeout(guard, timeout).unwrap();
+        Ok(self.usage()?.needs_reclaim())
     }
 }
 

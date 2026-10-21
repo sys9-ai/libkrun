@@ -1035,6 +1035,33 @@ int32_t krun_check_nested_virt(void);
 int32_t krun_has_feature(uint64_t feature);
 
 /**
+ * Reports host descriptors that virtiofs retains for guest inodes and open files,
+ * and the budget they can use before new ones fail with ENFILE (Linux only).
+ *
+ * Arguments:
+ *  "used"     - receives the retained descriptor count.
+ *  "capacity" - receives the current budget, derived from RLIMIT_NOFILE.
+ *
+ * Returns:
+ *  Zero on success, or -ENOENT before a virtiofs passthrough share exists.
+ */
+int32_t krun_get_virtiofs_descriptor_usage(uint64_t *used, uint64_t *capacity);
+
+/**
+ * Waits until virtiofs retains half of its descriptor budget (Linux only).
+ * Retained descriptors follow the guest's inode cache, which a guest with spare
+ * memory never shrinks. The caller can then have the guest drop unused dentries
+ * and inodes; their FORGET requests return the descriptors.
+ *
+ * Arguments:
+ *  "timeout_ms" - the maximum time to wait.
+ *
+ * Returns:
+ *  1 under pressure, 0 on timeout, or -ENOENT before a virtiofs passthrough share exists.
+ */
+int32_t krun_wait_virtiofs_descriptor_pressure(uint32_t timeout_ms);
+
+/**
  * Get the maximum number of vCPUs supported by the hypervisor.
  *
  * Returns:

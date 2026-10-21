@@ -14,6 +14,8 @@ pub mod linux;
 pub use linux::fs_utils;
 #[cfg(target_os = "linux")]
 pub use linux::passthrough;
+#[cfg(target_os = "linux")]
+pub use linux::{descriptor_usage, wait_descriptor_pressure, DescriptorUsage};
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]

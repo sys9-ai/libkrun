@@ -410,3 +410,46 @@ fn fd_budget_checkpoint_roundtrip_at_capacity() {
     restored.destroy();
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn fd_budget_signals_reclaim_at_half_and_clears_after_forget() {
+    if !in_child(concat!(
+        module_path!(),
+        "::fd_budget_signals_reclaim_at_half_and_clears_after_forget"
+    )) {
+        return;
+    }
+    use crate::virtio::fs::{descriptor_usage, wait_descriptor_pressure};
+    use std::time::Duration;
+    let (root, fs, other) = fixture(2048);
+    let usage = descriptor_usage().unwrap().unwrap();
+    assert!(!usage.needs_reclaim());
+    assert!(!wait_descriptor_pressure(Duration::from_millis(10))
+        .unwrap()
+        .unwrap());
+
+    let waiter = std::thread::spawn(|| wait_descriptor_pressure(Duration::from_secs(30)));
+    let mut entries = Vec::new();
+    while !descriptor_usage().unwrap().unwrap().needs_reclaim() {
+        let i = entries.len();
+        entries.push(fs.do_lookup(fuse::ROOT_ID, &name(i)).unwrap());
+    }
+    // The waiter wakes on the crossing, not on its 30-second timeout.
+    assert!(waiter.join().unwrap().unwrap().unwrap());
+    let pressured = descriptor_usage().unwrap().unwrap();
+    assert_eq!(
+        pressured.used * 2,
+        pressured.capacity + pressured.capacity % 2
+    );
+
+    for entry in entries.drain(..) {
+        fs.forget(ctx(), entry.inode, 1);
+    }
+    assert_eq!(descriptor_usage().unwrap().unwrap().used, usage.used);
+    assert!(!wait_descriptor_pressure(Duration::from_millis(10))
+        .unwrap()
+        .unwrap());
+    fs.destroy();
+    other.destroy();
+    std::fs::remove_dir_all(root).unwrap();
+}
