@@ -1913,6 +1913,44 @@ pub extern "C" fn krun_has_feature(feature: u64) -> c_int {
     supported as c_int
 }
 
+/// Reports host descriptors that virtiofs retains for guest inodes and open
+/// files, and the budget they can use before new ones fail with ENFILE.
+///
+/// Returns 0 on success, or -ENOENT before a virtiofs passthrough share exists.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub unsafe extern "C" fn krun_get_virtiofs_descriptor_usage(
+    used: *mut u64,
+    capacity: *mut u64,
+) -> i32 {
+    match devices::virtio::fs::descriptor_usage() {
+        None => -libc::ENOENT,
+        Some(Err(e)) => -e.raw_os_error().unwrap_or(libc::EIO),
+        Some(Ok(usage)) => {
+            *used = usage.used as u64;
+            *capacity = usage.capacity as u64;
+            KRUN_SUCCESS
+        }
+    }
+}
+
+/// Waits until virtiofs retains half of its descriptor budget. The caller can
+/// then have the guest drop unused dentries and inodes; their FORGET requests
+/// return the descriptors.
+///
+/// Returns 1 under pressure, 0 on timeout, or -ENOENT before a virtiofs
+/// passthrough share exists.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+pub extern "C" fn krun_wait_virtiofs_descriptor_pressure(timeout_ms: u32) -> i32 {
+    let timeout = std::time::Duration::from_millis(timeout_ms.into());
+    match devices::virtio::fs::wait_descriptor_pressure(timeout) {
+        None => -libc::ENOENT,
+        Some(Err(e)) => -e.raw_os_error().unwrap_or(libc::EIO),
+        Some(Ok(pressure)) => i32::from(pressure),
+    }
+}
+
 /// Gets the maximum number of vCPUs supported by the hypervisor.
 ///
 /// Returns the maximum number of vCPUs that can be created by this hypervisor,
