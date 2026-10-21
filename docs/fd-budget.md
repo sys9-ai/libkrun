@@ -31,6 +31,17 @@ reserves both a possible new inode and its open handle. Lookup of an already
 known inode releases an unused reservation. FORGET, RELEASE, backend destruction,
 and failed allocations return their permits.
 
+## Reclaim signal
+
+Retained descriptors follow the guest's inode cache, not its working set. A
+guest with spare memory keeps every inode it has seen, so touching many files
+eventually exhausts the budget even when few are in use at once.
+`krun_wait_virtiofs_descriptor_pressure` returns when half the current budget
+is retained; `krun_get_virtiofs_descriptor_usage` reports usage and capacity.
+The embedding process then has the guest drop unused dentries and inodes. Their
+FORGET requests return the descriptors. The crossing wakes waiters immediately;
+the wait timeout also picks up capacity changes from a new RLIMIT.
+
 ## Bounds
 
 This bounds guest filesystem retention, not arbitrary descriptor growth in other
@@ -47,10 +58,11 @@ error classification and production rollout are separate work.
 
 ## Verification
 
-On Linux, `make test-fd-budget` runs seven subprocess-isolated tests:
-revalidation and FORGET/RELEASE recovery, concurrent shares, low and changing
-limits, exported descriptor release, checkpoint restore accounting, same-limit restoration at capacity, and a
-preopened proc directory after chroot. The last test requires CAP_SYS_CHROOT;
+On Linux, `make test-fd-budget` runs eight subprocess-isolated tests: the
+reclaim signal, revalidation and FORGET/RELEASE recovery, concurrent shares,
+low and changing limits, exported descriptor release, checkpoint restore
+accounting, same-limit restoration at capacity, and a preopened proc directory
+after chroot. The last test requires CAP_SYS_CHROOT;
 run it as root in Docker to exercise that boundary.
 `make test-fs` also covers the existing passthrough and checkpoint tests.
 
