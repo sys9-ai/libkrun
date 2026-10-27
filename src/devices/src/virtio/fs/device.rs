@@ -80,6 +80,11 @@ impl Fs {
         let fs_cfg = passthrough::Config {
             root_dir: shared_dir,
             allow_root_dir_delete,
+            // Each guest write is otherwise a synchronous request to this
+            // server. The guest kernel flushes dirty pages on close, fsync
+            // and sync, so only data in files still open is held in the guest.
+            #[cfg(target_os = "linux")]
+            writeback: !read_only,
             ..Default::default()
         };
 
