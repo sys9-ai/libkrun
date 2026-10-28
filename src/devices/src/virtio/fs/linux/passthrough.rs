@@ -62,15 +62,15 @@ struct InodeData {
     dev: u64,
     mnt_id: u64,
     refcount: AtomicU64,
-    // This server is the only writer of the override xattr while the inode is
-    // live: guest xattr names are remapped, and Run9 writes a rootfs on the
-    // host only while no VM serves it. Reading it once per inode saves a host
-    // getxattr on every lookup, getattr and create.
+    // Used only when `Config::cache_guest_metadata` declares this server the
+    // only writer of the override xattr (guest xattr names are remapped). One
+    // read per inode then replaces a host getxattr on every lookup, getattr
+    // and create.
     override_stat: Mutex<Option<OverrideStat>>,
 }
 
 impl InodeData {
-    fn override_stat(&self) -> io::Result<OverrideStat> {
+    fn cached_override_stat(&self) -> io::Result<OverrideStat> {
         let mut cached = self.override_stat.lock().unwrap();
         if let Some(value) = *cached {
             return Ok(value);
@@ -80,11 +80,15 @@ impl InodeData {
         Ok(value)
     }
 
-    fn set_override_stat(&self, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
+    fn set_cached_override_stat(
+        &self,
+        owner: Option<(u32, u32)>,
+        mode: Option<u32>,
+    ) -> io::Result<()> {
         let mut cached = self.override_stat.lock().unwrap();
         let current = match *cached {
             Some(value) => value,
-            None => read_override_stat(self.file.as_raw_fd()).unwrap_or_default(),
+            None => read_override_stat_for_update(self.file.as_raw_fd(), owner, mode)?,
         };
         *cached = Some(write_override_stat(
             self.file.as_raw_fd(),
@@ -93,19 +97,6 @@ impl InodeData {
             current,
         )?);
         Ok(())
-    }
-
-    fn guest_stat(
-        &self,
-        host_uid: Option<libc::uid_t>,
-        host_gid: Option<libc::gid_t>,
-    ) -> io::Result<libc::stat64> {
-        let st = host_stat(&self.file)?;
-        // An unreadable override leaves the host attributes, as before caching.
-        let value = self.override_stat().unwrap_or_default();
-        Ok(apply_override_stat(
-            st, value.uid, value.gid, value.mode, host_uid, host_gid,
-        ))
     }
 }
 
@@ -152,6 +143,7 @@ impl ScopedCaps {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::FromRawFd;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -541,13 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn override_stat_is_read_from_the_host_once_per_inode() {
+    fn exclusive_share_reads_override_stat_once_per_inode() {
         let dir = unique_tmp_dir("override-read-once");
         let existing = File::create(dir.join("existing")).unwrap();
         set_override_xattr(existing.as_raw_fd(), Some((33, 44)), Some(0o640)).unwrap();
         drop(existing);
         let fs = PassthroughFs::new(Config {
             root_dir: dir.to_str().unwrap().to_string(),
+            cache_guest_metadata: true,
             ..Config::default()
         })
         .unwrap();
@@ -593,10 +586,32 @@ mod tests {
     }
 
     #[test]
-    fn cached_override_stat_follows_guest_chmod_and_chown() {
+    fn shared_directory_rereads_override_stat_on_every_request() {
+        let dir = unique_tmp_dir("override-reread");
+        File::create(dir.join("file")).unwrap();
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let entry = fs.do_lookup(fuse::ROOT_ID, c"file").unwrap();
+
+        // Another writer changes the owner while the inode is live.
+        let file = File::open(dir.join("file")).unwrap();
+        set_override_xattr(file.as_raw_fd(), Some((33, 44)), Some(0o640)).unwrap();
+        let (attr, _) = fs.getattr(root_ctx(), entry.inode, None).unwrap();
+
+        assert_eq!((attr.st_uid, attr.st_gid), (33, 44));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cached_override_stat_matches_the_host_after_each_chmod_and_chown() {
         let dir = unique_tmp_dir("override-cache-updates");
         let fs = PassthroughFs::new(Config {
             root_dir: dir.to_str().unwrap().to_string(),
+            cache_guest_metadata: true,
             ..Config::default()
         })
         .unwrap();
@@ -613,12 +628,24 @@ mod tests {
                 Extensions::default(),
             )
             .unwrap();
+        let host = File::open(dir.join("file")).unwrap();
+        let assert_matches_host = |want: (u32, u32, u32)| {
+            let (got, _) = fs.getattr(root_ctx(), entry.inode, None).unwrap();
+            assert_eq!((got.st_uid, got.st_gid, got.st_mode & 0o7777), want);
+            let stored = read_override_stat(host.as_raw_fd()).unwrap();
+            assert_eq!(
+                (
+                    stored.uid,
+                    stored.gid,
+                    stored.mode.map(|mode| mode & 0o7777)
+                ),
+                (Some(want.0), Some(want.1), Some(want.2))
+            );
+        };
         let mut attr: libc::stat64 = unsafe { mem::zeroed() };
-        attr.st_mode = libc::S_IFREG | 0o4750;
-        fs.setattr(root_ctx(), entry.inode, attr, None, SetattrValid::MODE)
-            .unwrap();
-        attr.st_uid = 7;
-        attr.st_gid = 8;
+
+        attr.st_uid = 1;
+        attr.st_gid = 2;
         fs.setattr(
             root_ctx(),
             entry.inode,
@@ -627,18 +654,52 @@ mod tests {
             SetattrValid::UID | SetattrValid::GID,
         )
         .unwrap();
+        attr.st_mode = libc::S_IFREG | 0o4750;
+        fs.setattr(root_ctx(), entry.inode, attr, None, SetattrValid::MODE)
+            .unwrap();
+        assert_matches_host((1, 2, 0o4750));
 
-        let (got, _) = fs.getattr(root_ctx(), entry.inode, None).unwrap();
-        // chown clears setuid, as the guest kernel expects of this server.
-        assert_eq!(
-            (got.st_uid, got.st_gid, got.st_mode & 0o7777),
-            (7, 8, 0o750)
-        );
-        let file = File::open(dir.join("file")).unwrap();
-        assert_eq!(
-            get_override_xattr(file.as_raw_fd()).unwrap(),
-            (Some(7), Some(8), Some(libc::S_IFREG | 0o750))
-        );
+        // A uid-only chown keeps the group and clears setuid.
+        attr.st_uid = 7;
+        fs.setattr(root_ctx(), entry.inode, attr, None, SetattrValid::UID)
+            .unwrap();
+        assert_matches_host((7, 2, 0o750));
+
+        attr.st_gid = 8;
+        fs.setattr(root_ctx(), entry.inode, attr, None, SetattrValid::GID)
+            .unwrap();
+        assert_matches_host((7, 8, 0o750));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writeback_open_falls_back_to_write_only_for_unreadable_files() {
+        let dir = unique_tmp_dir("writeback-write-only");
+        let path = dir.join("file");
+        File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        if File::open(&path).is_ok() {
+            // Running with CAP_DAC_OVERRIDE; the host can read anything.
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            writeback: true,
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::WRITEBACK_CACHE).unwrap();
+        let entry = fs.do_lookup(fuse::ROOT_ID, c"file").unwrap();
+
+        let (handle, _) = fs
+            .open(root_ctx(), entry.inode, false, libc::O_WRONLY as u32)
+            .unwrap();
+
+        let data = fs.handles.read().unwrap()[&handle.unwrap()].clone();
+        let fd = data.file.read().unwrap().as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_WRONLY);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -766,24 +827,44 @@ fn read_override_stat(fd: RawFd) -> io::Result<OverrideStat> {
         return Ok(OverrideStat::default());
     };
     let path = proc_fd_path(fd)?;
-    let mut buf = [0u8; 32];
-    let res = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            key.as_ptr() as *const libc::c_char,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-        )
-    };
-    if res < 0 {
-        let err = io::Error::last_os_error();
-        return if is_missing_override_xattr_error(&err) {
-            Ok(OverrideStat::default())
-        } else {
-            Err(err)
+    // Values written here fit in 32 bytes; other writers may store more.
+    let mut buf = vec![0u8; 32];
+    loop {
+        let res = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                key.as_ptr() as *const libc::c_char,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
         };
+        if res >= 0 {
+            return Ok(OverrideStat::parse(&buf[..res as usize]));
+        }
+        let err = io::Error::last_os_error();
+        if is_missing_override_xattr_error(&err) {
+            return Ok(OverrideStat::default());
+        }
+        if err.raw_os_error() != Some(libc::ERANGE) || buf.len() >= 64 * 1024 {
+            return Err(err);
+        }
+        let len = buf.len();
+        buf.resize(len * 8, 0);
     }
-    Ok(OverrideStat::parse(&buf[..res as usize]))
+}
+
+/// Reads the current value only when a partial update needs it to fill in
+/// the owner or mode it does not change.
+fn read_override_stat_for_update(
+    fd: RawFd,
+    owner: Option<(u32, u32)>,
+    mode: Option<u32>,
+) -> io::Result<OverrideStat> {
+    if is_valid_owner(owner) && mode.is_some() {
+        Ok(OverrideStat::default())
+    } else {
+        read_override_stat(fd)
+    }
 }
 
 #[cfg(test)]
@@ -816,7 +897,7 @@ fn is_valid_owner(owner: Option<(u32, u32)>) -> bool {
 }
 
 fn set_override_xattr(fd: RawFd, owner: Option<(u32, u32)>, mode: Option<u32>) -> io::Result<()> {
-    let current = read_override_stat(fd).unwrap_or_default();
+    let current = read_override_stat_for_update(fd, owner, mode)?;
     write_override_stat(fd, owner, mode, current).map(|_| ())
 }
 
@@ -1178,6 +1259,11 @@ pub struct Config {
     /// The default value for this option is `false`.
     pub writeback: bool,
 
+    /// Whether this server is the only writer of the override xattrs that
+    /// carry guest owner and mode, so each inode's value can be read once and
+    /// kept in memory. The default is `false`.
+    pub cache_guest_metadata: bool,
+
     /// The path of the root directory.
     ///
     /// The default is `/`.
@@ -1212,6 +1298,7 @@ impl Default for Config {
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
             writeback: false,
+            cache_guest_metadata: false,
             root_dir: String::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
@@ -1369,6 +1456,41 @@ impl PassthroughFs {
         })
     }
 
+    fn override_stat(&self, data: &InodeData) -> io::Result<OverrideStat> {
+        if self.cfg.cache_guest_metadata {
+            data.cached_override_stat()
+        } else {
+            read_override_stat(data.file.as_raw_fd())
+        }
+    }
+
+    fn set_override_stat(
+        &self,
+        data: &InodeData,
+        owner: Option<(u32, u32)>,
+        mode: Option<u32>,
+    ) -> io::Result<()> {
+        if self.cfg.cache_guest_metadata {
+            data.set_cached_override_stat(owner, mode)
+        } else {
+            set_override_xattr(data.file.as_raw_fd(), owner, mode)
+        }
+    }
+
+    fn guest_stat(&self, data: &InodeData) -> io::Result<libc::stat64> {
+        let st = host_stat(&data.file)?;
+        // An unreadable override leaves the host attributes.
+        let value = self.override_stat(data).unwrap_or_default();
+        Ok(apply_override_stat(
+            st,
+            value.uid,
+            value.gid,
+            value.mode,
+            self.my_uid,
+            self.my_gid,
+        ))
+    }
+
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
         let data = self
             .inodes
@@ -1385,7 +1507,8 @@ impl PassthroughFs {
         // userspace program opened the file write-only. So we need to ensure that we have opened
         // the file for reading as well as writing.
         let writeback = self.writeback.load(Ordering::Relaxed);
-        if writeback && flags & libc::O_ACCMODE == libc::O_WRONLY {
+        let requested_access = flags & libc::O_ACCMODE;
+        if writeback && requested_access == libc::O_WRONLY {
             flags &= !libc::O_ACCMODE;
             flags |= libc::O_RDWR;
         }
@@ -1404,13 +1527,22 @@ impl PassthroughFs {
         // really check `flags` because if the kernel can't handle poorly specified flags then we
         // have much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since we need
         // to follow the `/proc/self/fd` symlink to get the file.
-        let fd = unsafe {
+        let open = |flags: i32| unsafe {
             libc::openat(
                 self.proc_self_fd.as_raw_fd(),
                 pathname.as_ptr(),
                 (flags | libc::O_CLOEXEC) & (!libc::O_NOFOLLOW),
             )
         };
+        let mut fd = open(flags);
+        // A file this server may write but not read still opens write-only;
+        // the guest then cannot fill partial pages from it.
+        if fd < 0
+            && flags & libc::O_ACCMODE != requested_access
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+        {
+            fd = open((flags & !libc::O_ACCMODE) | requested_access);
+        }
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1482,11 +1614,12 @@ impl PassthroughFs {
         let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
         // A new inode starts with the value read here; an unreadable override
         // is left uncached and shown as the host attributes.
+        let cache = self.cfg.cache_guest_metadata;
         let (known_override, cached_override) = match &data {
-            Some(data) => (data.override_stat().unwrap_or_default(), None),
-            None if created => (OverrideStat::default(), Some(OverrideStat::default())),
+            Some(data) => (self.override_stat(data).unwrap_or_default(), None),
+            None if created && cache => (OverrideStat::default(), Some(OverrideStat::default())),
             None => match read_override_stat(f.as_raw_fd()) {
-                Ok(value) => (value, Some(value)),
+                Ok(value) => (value, cache.then_some(value)),
                 Err(_) => (OverrideStat::default(), None),
             },
         };
@@ -1781,7 +1914,7 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let mut st = data.guest_stat(self.my_uid, self.my_gid)?;
+        let mut st = self.guest_stat(&data)?;
         st.st_ino = data.guest_ino;
 
         Ok((st, self.cfg.attr_timeout))
@@ -1801,7 +1934,7 @@ impl PassthroughFs {
             .get(&inode)
             .cloned()
             .ok_or_else(ebadf)?;
-        data.set_override_stat(Some((uid, gid)), mode)
+        self.set_override_stat(&data, Some((uid, gid)), mode)
     }
 
     fn refresh_entry_attr(&self, mut entry: Entry) -> io::Result<Entry> {
@@ -1825,7 +1958,7 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
 
-        let st = data.guest_stat(self.my_uid, self.my_gid)?;
+        let st = self.guest_stat(&data)?;
         check_stat_access(ctx, &st, mask, supplementary_gids)
     }
 
@@ -2218,8 +2351,9 @@ impl FileSystem for PassthroughFs {
         // The writeback cache may read pages of a write-only file and owns
         // `O_APPEND`, as in `open_inode`.
         let mut flags = flags as i32;
+        let requested_access = flags & libc::O_ACCMODE;
         if self.writeback.load(Ordering::Relaxed) {
-            if flags & libc::O_ACCMODE == libc::O_WRONLY {
+            if requested_access == libc::O_WRONLY {
                 flags = (flags & !libc::O_ACCMODE) | libc::O_RDWR;
             }
             flags &= !libc::O_APPEND;
@@ -2243,13 +2377,20 @@ impl FileSystem for PassthroughFs {
         {
             // A stale negative lookup or concurrent host create can reach here.
             // Opening an existing inode must not reset its owner or permissions.
-            fd = unsafe {
+            let open_existing = |flags: i32| unsafe {
                 libc::openat(
                     data.file.as_raw_fd(),
                     name.as_ptr(),
                     (flags & !libc::O_CREAT) | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 )
             };
+            fd = open_existing(flags);
+            if fd < 0
+                && flags & libc::O_ACCMODE != requested_access
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+            {
+                fd = open_existing((flags & !libc::O_ACCMODE) | requested_access);
+            }
         }
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -2373,11 +2514,11 @@ impl FileSystem for PassthroughFs {
                 .get(&inode)
                 .cloned()
                 .ok_or_else(ebadf)?;
-            if inode_data.override_stat()?.present {
-                let st = inode_data.guest_stat(self.my_uid, self.my_gid)?;
+            if self.override_stat(&inode_data)?.present {
+                let st = self.guest_stat(&inode_data)?;
                 let mode = clear_suid_sgid(st.st_mode);
                 if mode != st.st_mode {
-                    inode_data.set_override_stat(None, Some(mode))?;
+                    self.set_override_stat(&inode_data, None, Some(mode))?;
                 }
             }
         }
@@ -2434,8 +2575,8 @@ impl FileSystem for PassthroughFs {
         };
 
         if valid.contains(SetattrValid::MODE) {
-            if inode_data.override_stat()?.present {
-                inode_data.set_override_stat(None, Some(attr.st_mode))?;
+            if self.override_stat(&inode_data)?.present {
+                self.set_override_stat(&inode_data, None, Some(attr.st_mode))?;
             } else {
                 // Safe because this doesn't modify any memory and we check the return value.
                 let res = unsafe {
@@ -2452,7 +2593,7 @@ impl FileSystem for PassthroughFs {
                 if res < 0 {
                     let err = io::Error::last_os_error();
                     if should_store_override_stat_for_setattr_error(&err) {
-                        inode_data.set_override_stat(None, Some(attr.st_mode))?;
+                        self.set_override_stat(&inode_data, None, Some(attr.st_mode))?;
                     } else {
                         return Err(err);
                     }
@@ -2474,7 +2615,7 @@ impl FileSystem for PassthroughFs {
                 u32::MAX
             };
 
-            let st = inode_data.guest_stat(self.my_uid, self.my_gid)?;
+            let st = self.guest_stat(&inode_data)?;
             let mode = clear_suid_sgid(st.st_mode);
             let mode = if mode != st.st_mode { Some(mode) } else { None };
             // A no-op chown of a native whiteout must not attempt user.*
@@ -2483,7 +2624,7 @@ impl FileSystem for PassthroughFs {
                 || (gid != u32::MAX && gid != st.st_gid)
                 || mode.is_some()
             {
-                inode_data.set_override_stat(Some((uid, gid)), mode)?;
+                self.set_override_stat(&inode_data, Some((uid, gid)), mode)?;
             }
         }
 

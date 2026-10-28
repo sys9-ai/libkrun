@@ -69,9 +69,12 @@ impl Fs {
         exit_code: Arc<AtomicI32>,
         allow_root_dir_delete: bool,
         read_only: bool,
+        exclusive: bool,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
+        #[cfg(target_os = "macos")]
+        let _ = exclusive;
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
@@ -80,11 +83,13 @@ impl Fs {
         let fs_cfg = passthrough::Config {
             root_dir: shared_dir,
             allow_root_dir_delete,
-            // Each guest write is otherwise a synchronous request to this
-            // server. The guest kernel flushes dirty pages on close, fsync
-            // and sync, so only data in files still open is held in the guest.
+            // Both are unsafe if anything else changes the directory: cached
+            // guest metadata would go stale, and the guest would trust its own
+            // cached file sizes and data.
             #[cfg(target_os = "linux")]
-            writeback: !read_only,
+            cache_guest_metadata: exclusive,
+            #[cfg(target_os = "linux")]
+            writeback: exclusive && !read_only,
             ..Default::default()
         };
 

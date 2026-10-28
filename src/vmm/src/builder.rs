@@ -1972,6 +1972,7 @@ fn attach_fs_devices(
                 exit_code.clone(),
                 config.allow_root_dir_delete,
                 config.read_only,
+                config.exclusive,
             )
             .unwrap(),
         ));

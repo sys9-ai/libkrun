@@ -596,6 +596,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: false,
                 read_only: false,
+                exclusive: false,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -637,6 +638,20 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
     shm_size: u64,
     read_only: bool,
 ) -> i32 {
+    krun_add_virtiofs4(ctx_id, c_tag, c_path, shm_size, read_only, false)
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(feature = "tee"))]
+pub unsafe extern "C" fn krun_add_virtiofs4(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    exclusive: bool,
+) -> i32 {
     if c_tag.is_null() || c_path.is_null() {
         return -libc::EINVAL;
     }
@@ -668,6 +683,7 @@ pub unsafe extern "C" fn krun_add_virtiofs3(
                 shm_size: shm,
                 allow_root_dir_delete: false,
                 read_only,
+                exclusive,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2365,6 +2381,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 shm_size: Some(1 << 29),
                 allow_root_dir_delete: true,
                 read_only: false,
+                exclusive: false,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);

@@ -5,4 +5,7 @@ pub struct FsDeviceConfig {
     pub shm_size: Option<usize>,
     pub allow_root_dir_delete: bool,
     pub read_only: bool,
+    /// Only this VM changes the shared directory while it runs, so guest
+    /// metadata may be cached and the guest may cache writes.
+    pub exclusive: bool,
 }

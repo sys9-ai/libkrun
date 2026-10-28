@@ -143,7 +143,7 @@ impl PassthroughFs {
                     } else {
                         0
                     };
-                    let attr = inode.guest_stat(self.my_uid, self.my_gid)?;
+                    let attr = self.guest_stat(inode)?;
                     let mut xattrs = Vec::new();
                     for name in list_host_xattrs(&FileOrLink::File(inode.file.try_clone()?))?
                         .split(|byte| *byte == 0)
