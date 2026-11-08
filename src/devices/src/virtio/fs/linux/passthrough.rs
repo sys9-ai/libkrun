@@ -604,6 +604,22 @@ mod tests {
     }
 
     #[test]
+    fn always_cache_policy_keeps_a_directory_listing_across_opens() {
+        let dir = unique_tmp_dir("keep-dir-cache");
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            cache_policy: CachePolicy::Always,
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let (_, opts) = fs.opendir(root_ctx(), fuse::ROOT_ID, 0).unwrap();
+        assert_eq!(opts, OpenOptions::KEEP_CACHE | OpenOptions::CACHE_DIR);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn shared_directory_reports_a_missing_name_as_an_error() {
         let dir = unique_tmp_dir("missing-name-error");
         let fs = PassthroughFs::new(Config {
@@ -1910,10 +1926,12 @@ impl PassthroughFs {
                 OpenOptions::DIRECT_IO,
                 flags & (libc::O_DIRECTORY as u32) == 0,
             ),
+            // A directory needs KEEP_CACHE as well: the kernel drops a
+            // directory's cached listing on every opendir without it, so
+            // CACHE_DIR alone would never serve a listing from the cache.
             CachePolicy::Always => {
-                if flags & (libc::O_DIRECTORY as u32) == 0 {
-                    opts |= OpenOptions::KEEP_CACHE;
-                } else {
+                opts |= OpenOptions::KEEP_CACHE;
+                if flags & (libc::O_DIRECTORY as u32) != 0 {
                     opts |= OpenOptions::CACHE_DIR;
                 }
             }
