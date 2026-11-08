@@ -1973,6 +1973,7 @@ fn attach_fs_devices(
                 config.allow_root_dir_delete,
                 config.read_only,
                 config.exclusive,
+                config.writeback,
             )
             .unwrap(),
         ));

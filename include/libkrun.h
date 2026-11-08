@@ -363,7 +363,9 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
  *
  * Arguments:
  *  "exclusive"      - if true, nothing else changes the directory while this VM
- *                     serves it. On Linux the server then reads the guest owner and
+ *                     serves it. On Linux the guest then caches entries, missing
+ *                     names, attributes, directory listings and file data instead
+ *                     of revalidating them, the server reads the guest owner and
  *                     mode of each inode once instead of on every request, and a
  *                     writable share lets the guest cache writes (FUSE writeback).
  *                     Data in files the guest has not closed, fsynced or synced may
@@ -379,6 +381,34 @@ int32_t krun_add_virtiofs4(uint32_t ctx_id,
                            uint64_t shm_size,
                            bool read_only,
                            bool exclusive);
+
+/**
+ * Like krun_add_virtiofs4(), but asks for FUSE writeback separately.
+ *
+ * Arguments:
+ *  "exclusive"      - if true, nothing else changes the directory while this VM
+ *                     serves it. On Linux the guest then caches entries, missing
+ *                     names, attributes, directory listings and file data for a
+ *                     day instead of revalidating them, and the server reads the
+ *                     guest owner and mode of each inode once. Host readers still
+ *                     see every write the guest has sent.
+ *  "writeback"      - if true for a writable exclusive share, the guest also
+ *                     caches writes, with the consequences described for
+ *                     krun_add_virtiofs4(). Ignored otherwise.
+ *
+ * krun_add_virtiofs4(ctx, tag, path, shm, ro, ex) equals
+ * krun_add_virtiofs5(ctx, tag, path, shm, ro, ex, ex).
+ *
+ * Returns:
+ *  Zero on success or a negative error number on failure.
+ */
+int32_t krun_add_virtiofs5(uint32_t ctx_id,
+                           const char *c_tag,
+                           const char *c_path,
+                           uint64_t shm_size,
+                           bool read_only,
+                           bool exclusive,
+                           bool writeback);
 
 /* Send the VFKIT magic after establishing the connection,
    as required by gvproxy in vfkit mode. */

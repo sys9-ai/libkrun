@@ -40,6 +40,13 @@ impl Default for VirtioFsConfig {
 
 unsafe impl ByteValued for VirtioFsConfig {}
 
+/// How long the guest may trust cached entries and attributes of an exclusive
+/// share without asking again. Nothing else changes such a share, so the bound
+/// only limits how long a server bug could stay hidden; one day matches
+/// virtiofsd's `cache=always`.
+#[cfg(target_os = "linux")]
+const EXCLUSIVE_CACHE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 pub struct Fs {
     avail_features: u64,
     acked_features: u64,
@@ -70,28 +77,38 @@ impl Fs {
         allow_root_dir_delete: bool,
         read_only: bool,
         exclusive: bool,
+        writeback: bool,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
-        #[cfg(target_os = "macos")]
-        let _ = exclusive;
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        let fs_cfg = passthrough::Config {
+        #[allow(unused_mut)]
+        let mut fs_cfg = passthrough::Config {
             root_dir: shared_dir,
             allow_root_dir_delete,
-            // Both are unsafe if anything else changes the directory: cached
-            // guest metadata would go stale, and the guest would trust its own
-            // cached file sizes and data.
-            #[cfg(target_os = "linux")]
-            cache_guest_metadata: exclusive,
-            #[cfg(target_os = "linux")]
-            writeback: exclusive && !read_only,
             ..Default::default()
         };
+        // Each of these is unsafe if anything else changes the directory while
+        // this VM serves it: the guest would keep trusting the owners, names,
+        // missing names, attributes, directory listings and file data it
+        // cached, and writeback would keep data only in guest memory. When the
+        // guest is the only writer, its kernel updates these caches itself, so
+        // they never go stale and every hit saves a round trip to this server.
+        #[cfg(target_os = "linux")]
+        if exclusive {
+            fs_cfg.entry_timeout = EXCLUSIVE_CACHE_TIMEOUT;
+            fs_cfg.attr_timeout = EXCLUSIVE_CACHE_TIMEOUT;
+            fs_cfg.cache_policy = passthrough::CachePolicy::Always;
+            fs_cfg.cache_negative_entries = true;
+            fs_cfg.cache_guest_metadata = true;
+            fs_cfg.writeback = writeback && !read_only;
+        }
+        #[cfg(target_os = "macos")]
+        let _ = (exclusive, writeback);
 
         Ok(Fs {
             avail_features,

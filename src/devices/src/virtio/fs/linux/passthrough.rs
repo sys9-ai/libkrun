@@ -586,6 +586,42 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_share_answers_a_missing_name_with_a_negative_entry() {
+        let dir = unique_tmp_dir("negative-entry");
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            cache_negative_entries: true,
+            entry_timeout: Duration::from_secs(60),
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let missing = fs.lookup(root_ctx(), fuse::ROOT_ID, c"missing").unwrap();
+        assert_eq!(missing.inode, 0);
+        assert_eq!(missing.entry_timeout, Duration::from_secs(60));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_directory_reports_a_missing_name_as_an_error() {
+        let dir = unique_tmp_dir("missing-name-error");
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let err = fs
+            .lookup(root_ctx(), fuse::ROOT_ID, c"missing")
+            .err()
+            .unwrap();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn shared_directory_rereads_override_stat_on_every_request() {
         let dir = unique_tmp_dir("override-reread");
         File::create(dir.join("file")).unwrap();
@@ -1264,6 +1300,12 @@ pub struct Config {
     /// kept in memory. The default is `false`.
     pub cache_guest_metadata: bool,
 
+    /// Whether a lookup of a missing name answers with a negative entry the
+    /// guest may cache for `entry_timeout`, instead of an error it cannot
+    /// cache. Only correct when nothing but the guest creates names here.
+    /// The default is `false`.
+    pub cache_negative_entries: bool,
+
     /// The path of the root directory.
     ///
     /// The default is `/`.
@@ -1299,6 +1341,7 @@ impl Default for Config {
             cache_policy: Default::default(),
             writeback: false,
             cache_guest_metadata: false,
+            cache_negative_entries: false,
             root_dir: String::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
@@ -2171,7 +2214,24 @@ impl FileSystem for PassthroughFs {
                 entry_timeout: self.cfg.entry_timeout,
             })
         } else {
-            self.do_lookup(parent, name)
+            match self.do_lookup(parent, name) {
+                Err(e)
+                    if self.cfg.cache_negative_entries
+                        && e.raw_os_error() == Some(libc::ENOENT) =>
+                {
+                    // Inode 0 is FUSE's negative entry: the guest remembers the
+                    // name is missing until it creates it or the entry expires.
+                    Ok(Entry {
+                        inode: 0,
+                        generation: 0,
+                        attr: unsafe { mem::zeroed() },
+                        attr_flags: 0,
+                        attr_timeout: Duration::ZERO,
+                        entry_timeout: self.cfg.entry_timeout,
+                    })
+                }
+                result => result,
+            }
         }
     }
 
