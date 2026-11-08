@@ -180,6 +180,62 @@ mod tests {
     }
 
     #[test]
+    fn writeback_reports_a_ctime_delayed_by_write_back_as_mtime() {
+        let mut st = stat_with_owner(0, 0, 0o644);
+        (st.st_mtime, st.st_mtime_nsec) = (100, 973_605_846);
+        (st.st_ctime, st.st_ctime_nsec) = (101, 161_242_772);
+
+        let got = writeback_ctime(st);
+
+        assert_eq!((got.st_ctime, got.st_ctime_nsec), (100, 973_605_846));
+    }
+
+    #[test]
+    fn writeback_keeps_a_ctime_beyond_the_slack_or_before_mtime() {
+        let mut changed_later = stat_with_owner(0, 0, 0o644);
+        (changed_later.st_mtime, changed_later.st_ctime) = (100, 161);
+        let mut mtime_in_future = stat_with_owner(0, 0, 0o644);
+        (mtime_in_future.st_mtime, mtime_in_future.st_ctime) = (200, 100);
+
+        assert_eq!(writeback_ctime(changed_later).st_ctime, 161);
+        assert_eq!(writeback_ctime(mtime_in_future).st_ctime, 100);
+    }
+
+    #[test]
+    fn writeback_keeps_a_directory_ctime() {
+        let mut st = stat_with_owner(0, 0, 0o755);
+        st.st_mode = libc::S_IFDIR | 0o755;
+        (st.st_mtime, st.st_ctime) = (100, 101);
+
+        assert_eq!(writeback_ctime(st).st_ctime, 101);
+    }
+
+    #[test]
+    fn writeback_share_reports_the_ctime_the_guest_assigned() {
+        let dir = unique_tmp_dir("writeback-ctime");
+        // As after a guest write-back: the mtime is the guest's, and the host
+        // stamps the ctime when it applies it.
+        let file = File::create(dir.join("file")).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            writeback: true,
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::WRITEBACK_CACHE).unwrap();
+
+        let attr = fs.lookup(root_ctx(), fuse::ROOT_ID, c"file").unwrap().attr;
+
+        assert_eq!(
+            (attr.st_ctime, attr.st_ctime_nsec),
+            (attr.st_mtime, attr.st_mtime_nsec)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn override_xattr_parser_reads_mode_as_octal() {
         let (uid, gid, mode) = get_xattr_common(b"0:0:0755");
 
@@ -1108,6 +1164,38 @@ fn apply_override_stat(
     st
 }
 
+/// How far a regular file's host ctime may trail its mtime and still be taken
+/// as the time its write-back landed rather than a later change of its own.
+/// Dirty pages are written back within about 35 s (the kernel's default
+/// expiry plus flusher interval); the margin covers a slow host.
+const WRITEBACK_CTIME_SLACK: Duration = Duration::from_secs(60);
+
+/// Reports a regular file's mtime as its ctime when the host ctime is only
+/// the write-back delay after it.
+///
+/// With FUSE writeback the guest kernel keeps its own mtime and ctime for
+/// regular files: a write stamps both with the same instant, and the inode's
+/// write-back sends them here. The host takes the mtime but cannot take a
+/// ctime, so it records the moment the write-back landed instead. The guest
+/// trusts its own value while the inode stays cached, but after a restart it
+/// reads the host's, which differs for every file it wrote; tools that trust
+/// ctime, such as git, then treat those files as changed and read them all
+/// again. Reporting the mtime gives back
+/// exactly the ctime the guest assigned. A metadata change within the slack
+/// after a write is reported up to the slack early; a later one, or a file
+/// whose mtime was set into the past, keeps the host ctime.
+fn writeback_ctime(mut st: libc::stat64) -> libc::stat64 {
+    let nanos = |sec: i64, nsec: i64| i128::from(sec) * 1_000_000_000 + i128::from(nsec);
+    let delay = nanos(st.st_ctime, st.st_ctime_nsec) - nanos(st.st_mtime, st.st_mtime_nsec);
+    if st.st_mode & libc::S_IFMT == libc::S_IFREG
+        && (0..=WRITEBACK_CTIME_SLACK.as_nanos() as i128).contains(&delay)
+    {
+        st.st_ctime = st.st_mtime;
+        st.st_ctime_nsec = st.st_mtime_nsec;
+    }
+    st
+}
+
 fn host_stat_fd(fd: RawFd) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
@@ -1540,14 +1628,25 @@ impl PassthroughFs {
         let st = host_stat(&data.file)?;
         // An unreadable override leaves the host attributes.
         let value = self.override_stat(data).unwrap_or_default();
-        Ok(apply_override_stat(
+        Ok(self.guest_attr(st, value))
+    }
+
+    /// The attributes the guest sees for a host inode: its guest owner and
+    /// mode and, under writeback, the ctime the guest assigned.
+    fn guest_attr(&self, st: libc::stat64, value: OverrideStat) -> libc::stat64 {
+        let st = apply_override_stat(
             st,
             value.uid,
             value.gid,
             value.mode,
             self.my_uid,
             self.my_gid,
-        ))
+        );
+        if self.writeback.load(Ordering::Relaxed) {
+            writeback_ctime(st)
+        } else {
+            st
+        }
     }
 
     fn open_inode(&self, inode: Inode, mut flags: i32) -> io::Result<File> {
@@ -1682,14 +1781,7 @@ impl PassthroughFs {
                 Err(_) => (OverrideStat::default(), None),
             },
         };
-        let mut attr = apply_override_stat(
-            st,
-            known_override.uid,
-            known_override.gid,
-            known_override.mode,
-            self.my_uid,
-            self.my_gid,
-        );
+        let mut attr = self.guest_attr(st, known_override);
 
         let mut attr_flags: u32 = 0;
 
