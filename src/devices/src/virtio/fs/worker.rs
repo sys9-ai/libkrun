@@ -66,11 +66,16 @@ impl FsServer {
 /// allowed: the guest matches each reply to its request by the FUSE unique
 /// ID, and this device does not offer VIRTIO_F_IN_ORDER.
 ///
+/// Four covers what serving at once gains on slow storage: a cached read is
+/// not held up by a process reading uncached files one after another, and
+/// four readers of one uncached file fetch in parallel. Every further thread
+/// is a stack and a kernel task kept for each share of every VM.
+///
 /// The macOS passthrough keeps per-inode state that its operations do not
 /// synchronize with each other (the descriptor kept for an unlinked file), so
 /// it serves one request at a time.
 #[cfg(target_os = "linux")]
-const REQUEST_THREADS: usize = 16;
+const REQUEST_THREADS: usize = 4;
 #[cfg(target_os = "macos")]
 const REQUEST_THREADS: usize = 1;
 
@@ -85,11 +90,19 @@ type Request<'a> = (usize, DescriptorChain<'a>);
 /// idle share answers a request without first waking another thread.
 struct Pool<'a> {
     leader: Mutex<Leader>,
-    /// Threads waiting to become the leader.
-    waiting: AtomicUsize,
-    /// Threads serving this share. A share starts with one and gains one
-    /// whenever a request is taken while no thread waits to lead, up to
-    /// `REQUEST_THREADS`, so a share costs threads only as it is used.
+    /// Threads free to take the next request: a thread counts from when it
+    /// is started, and from just before it answers its last request, until
+    /// it has taken the next one. So the leader waiting for the guest counts,
+    /// as do a thread not yet running and one whose answer the guest may
+    /// already have. A thread that takes a request and was the last one
+    /// counted leaves none to take the next while it serves this one.
+    idle: AtomicUsize,
+    /// Threads serving this share. A share starts with one and gains one only
+    /// when a request is taken while no other thread is idle, up to
+    /// `REQUEST_THREADS`: requests sent one after another keep two threads,
+    /// one serving and one leading, and only requests that wait together
+    /// start more. One sequential reader may still use two or three, as the
+    /// guest's readahead overlaps its requests.
     threads: AtomicUsize,
     /// Requests that change an inode, kept in the order the guest sent them.
     /// An inode has an entry while a thread serves one of its changes; the
@@ -108,7 +121,7 @@ struct Leader {
 }
 
 /// The inode whose data or attributes `head` changes, or None for any other
-/// request. A request whose header cannot be read is left to `serve` to
+/// request. A request whose header cannot be read is left to `handle` to
 /// reject. The serving thread reads the header again; a guest that changes it
 /// in between only misorders its own requests.
 fn changed_inode(mem: &GuestMemoryMmap, head: &DescriptorChain) -> Option<u64> {
@@ -199,7 +212,7 @@ impl FsWorker {
                 epoll,
                 stopping: false,
             }),
-            waiting: AtomicUsize::new(0),
+            idle: AtomicUsize::new(1),
             threads: AtomicUsize::new(1),
             changing: Mutex::new(HashMap::new()),
         };
@@ -212,10 +225,10 @@ impl FsWorker {
         scope: &'scope thread::Scope<'scope, 'env>,
         pool: &'env Pool<'env>,
     ) {
-        while let Some((request, inode)) = self.take_request(pool) {
-            // Start a thread if none is left to take the next request while
-            // this one is served.
-            let grow = pool.waiting.load(Ordering::SeqCst) == 0
+        while let Some((mut request, inode)) = self.take_request(pool) {
+            // Start a thread if this one was the last idle one, so that one
+            // is left to take the next request while this request is served.
+            let grow = pool.idle.fetch_sub(1, Ordering::SeqCst) == 1
                 && pool
                     .threads
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |threads| {
@@ -223,19 +236,23 @@ impl FsWorker {
                     })
                     .is_ok();
             if grow {
+                // Until a failed start is undone below, `idle` counts a thread
+                // that never runs, so a request taken meanwhile starts none;
+                // the next request taken with no thread idle tries again.
+                pool.idle.fetch_add(1, Ordering::SeqCst);
                 if let Err(e) = thread::Builder::new()
                     .name("fs request".into())
                     .spawn_scoped(scope, move || self.serve_requests(scope, pool))
                 {
+                    pool.idle.fetch_sub(1, Ordering::SeqCst);
                     pool.threads.fetch_sub(1, Ordering::SeqCst);
                     warn!("virtio-fs serves with fewer threads, one failed to start: {e}");
                 }
             }
-            self.serve(request);
-            let Some(inode) = inode else { continue };
-            // Serve the changes of this inode popped meanwhile, in order.
             loop {
-                let next = {
+                self.handle(&request.1);
+                // Then the changes of this inode popped meanwhile, in order.
+                let next = inode.and_then(|inode| {
                     let mut changing = pool.changing.lock().unwrap();
                     // Only this thread removes the entry it created, and it
                     // drains the entry before it leads again, so the entry is
@@ -248,11 +265,15 @@ impl FsWorker {
                         pending.remove();
                     }
                     next
-                };
-                match next {
-                    Some(request) => self.serve(request),
-                    None => break,
+                });
+                // Idle again before the guest can see the last answer, so that
+                // a request the guest sends in reply finds this thread idle.
+                if next.is_none() {
+                    pool.idle.fetch_add(1, Ordering::SeqCst);
                 }
+                self.answer(request);
+                let Some(next) = next else { break };
+                request = next;
             }
         }
     }
@@ -260,9 +281,7 @@ impl FsWorker {
     /// Becomes the leader and pops the next request this thread serves, and
     /// the inode it changes, if any. Returns None once the worker stops.
     fn take_request<'a>(&'a self, pool: &Pool<'a>) -> Option<(Request<'a>, Option<u64>)> {
-        pool.waiting.fetch_add(1, Ordering::SeqCst);
         let mut leader = pool.leader.lock().unwrap();
-        pool.waiting.fetch_sub(1, Ordering::SeqCst);
         loop {
             let request = self.next_request(&mut leader)?;
             let Some(inode) = changed_inode(&self.mem, &request.1) else {
@@ -350,11 +369,12 @@ impl FsWorker {
         }
     }
 
-    fn serve(&self, (queue_index, head): Request) {
-        let head_index = head.index;
+    /// Serves the request `head` on the host, writing the reply into its
+    /// buffers. The guest sees the reply only once it is answered.
+    fn handle(&self, head: &DescriptorChain) {
         match (
             Reader::new(&self.mem, head.clone()),
-            Writer::new(&self.mem, head),
+            Writer::new(&self.mem, head.clone()),
         ) {
             (Ok(reader), Ok(writer)) => {
                 if let Err(e) = self.server.handle_message(
@@ -372,10 +392,13 @@ impl FsWorker {
             (Err(e), _) => error!("{:?}", FsError::QueueReader(e)),
             (_, Err(e)) => error!("{:?}", FsError::QueueWriter(e)),
         }
+    }
 
+    /// Hands a handled request back to the guest.
+    fn answer(&self, (queue_index, head): Request) {
         let needs_notification = {
             let mut queue = self.queues[queue_index].lock().unwrap();
-            if let Err(e) = queue.add_used(&self.mem, head_index, 0) {
+            if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
             queue.needs_notification(&self.mem).unwrap()
@@ -468,6 +491,27 @@ mod tests {
     const BUFFERS: u64 = 0x10000;
     const BUFFER_SIZE: u64 = 0x1000;
 
+    /// Held by every test that starts a worker, so that a test can count the
+    /// request threads of its own worker as those of the process.
+    static ONE_WORKER: Mutex<()> = Mutex::new(());
+
+    fn one_worker() -> std::sync::MutexGuard<'static, ()> {
+        ONE_WORKER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How many "fs request" threads the process runs.
+    fn request_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter(|task| {
+                let comm = task.as_ref().unwrap().path().join("comm");
+                std::fs::read_to_string(comm).is_ok_and(|name| name == "fs request\n")
+            })
+            .count()
+    }
+
     /// The guest driver's side of the request queue: one request per pair of
     /// descriptors, a readable request and a writable reply buffer.
     struct Guest<'a> {
@@ -513,13 +557,16 @@ mod tests {
         }
 
         /// Whether the device has answered `count` requests within a second.
+        /// It spins rather than sleeps, so that the next request follows an
+        /// answer as closely as a guest process's would: a thread that counts
+        /// itself idle only after answering would then start threads.
         fn answered(&self, count: u16) -> bool {
             let deadline = Instant::now() + Duration::from_secs(1);
             while self.queue.used.idx.get() < count {
                 if Instant::now() > deadline {
                     return false;
                 }
-                thread::sleep(Duration::from_millis(1));
+                thread::yield_now();
             }
             true
         }
@@ -579,6 +626,7 @@ mod tests {
 
     #[test]
     fn a_blocked_request_does_not_hold_up_later_requests() {
+        let _one_worker = one_worker();
         let dir = std::env::temp_dir().join(format!("krun-fs-worker-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let fifo = std::ffi::CString::new(dir.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
@@ -639,6 +687,7 @@ mod tests {
 
     #[test]
     fn one_inodes_attribute_changes_reach_the_host_in_order() {
+        let _one_worker = one_worker();
         let dir = std::env::temp_dir().join(format!("krun-fs-order-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("file"), b"").unwrap();
@@ -662,6 +711,64 @@ mod tests {
 
         stop.write(1).unwrap();
         worker.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_share_starts_threads_only_for_requests_that_wait_together() {
+        let _one_worker = one_worker();
+        let dir = std::env::temp_dir().join(format!("krun-fs-threads-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let (worker, stop, mut guest) = start(&dir, &mem);
+        guest.send(Opcode::Lookup, ROOT_ID, b"fifo\0");
+        assert!(guest.answered(2));
+        let fifo = guest.reply::<EntryOut>(1).nodeid;
+
+        // Each request is sent as soon as the one before is answered, as by a
+        // process reading a file: one thread leads while the other serves.
+        for sent in 3..=12 {
+            guest.send(Opcode::Getattr, ROOT_ID, GetattrIn::default().as_slice());
+            assert!(guest.answered(sent));
+        }
+        // The thread started for the first request may not be running yet.
+        assert!(
+            request_threads() <= 1,
+            "requests sent one by one started threads"
+        );
+
+        // Each open holds its thread until a writer opens the FIFO, so the
+        // opens leave no thread idle and the share grows to its limit; the
+        // GETATTR behind them then waits for a thread.
+        let open = OpenIn {
+            flags: libc::O_RDONLY as u32,
+            open_flags: 0,
+        };
+        for _ in 0..REQUEST_THREADS {
+            guest.send(Opcode::Open, fifo, open.as_slice());
+        }
+        guest.send(Opcode::Getattr, ROOT_ID, GetattrIn::default().as_slice());
+        assert!(
+            !guest.answered(13),
+            "more than REQUEST_THREADS threads serve the share"
+        );
+        assert_eq!(
+            request_threads(),
+            REQUEST_THREADS - 1,
+            "the worker's own thread and the request threads"
+        );
+
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("fifo"))
+            .unwrap();
+        assert!(guest.answered(13 + REQUEST_THREADS as u16));
+        stop.write(1).unwrap();
+        worker.join().unwrap();
+        drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
