@@ -542,6 +542,46 @@ mod tests {
         assert_eq!(got, b"security.capability\0");
     }
 
+    #[test]
+    fn concurrent_lookups_and_forgets_keep_looked_up_inodes_known() {
+        let dir = unique_tmp_dir("lookup-forget-race");
+        std::fs::write(dir.join("file"), b"").unwrap();
+        let fs = PassthroughFs::new(Config {
+            root_dir: dir.to_str().unwrap().to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 1,
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..20_000 {
+                        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"file").unwrap();
+                        // Until its FORGET, the guest may use the inode a
+                        // lookup returned, whatever other FORGETs do.
+                        fs.getattr(ctx, entry.inode, None).unwrap();
+                        fs.forget(ctx, entry.inode, 1);
+                    }
+                });
+            }
+        });
+        // Every lookup was forgotten, and no duplicate entry was left behind.
+        let inodes: Vec<_> = fs
+            .inodes
+            .read()
+            .unwrap()
+            .values()
+            .map(|d| d.inode)
+            .collect();
+        assert_eq!(inodes, [fuse::ROOT_ID]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn unique_tmp_dir(name: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1501,7 +1541,12 @@ pub struct PassthroughFs {
 /// keeps the no-follow xattr path; it must never address the symlink's target.
 enum FileOrLink {
     File(File),
-    Link(CString),
+    /// A symlink's procfs path, with the inode whose descriptor the path names
+    /// kept alive so a concurrent FORGET cannot close it while the path is used.
+    Link {
+        path: CString,
+        _inode: Arc<InodeData>,
+    },
 }
 
 fn list_xattr_raw(
@@ -1513,7 +1558,9 @@ fn list_xattr_raw(
         FileOrLink::File(file) => unsafe {
             libc::listxattr(proc_fd_path(file.as_raw_fd())?.as_ptr(), buf, size)
         },
-        FileOrLink::Link(link) => unsafe { libc::llistxattr(link.as_ptr(), buf, size) },
+        FileOrLink::Link { path: link, .. } => unsafe {
+            libc::llistxattr(link.as_ptr(), buf, size)
+        },
     })
 }
 
@@ -1721,7 +1768,10 @@ impl PassthroughFs {
             .cloned()
             .ok_or_else(ebadf)?;
         if host_fd_is_symlink(data.file.as_raw_fd())? {
-            Ok(FileOrLink::Link(proc_fd_path(data.file.as_raw_fd())?))
+            Ok(FileOrLink::Link {
+                path: proc_fd_path(data.file.as_raw_fd())?,
+                _inode: data,
+            })
         } else {
             Ok(FileOrLink::File(data.file.try_clone()?))
         }
@@ -1769,19 +1819,57 @@ impl PassthroughFs {
             dev: st.st_dev,
             mnt_id,
         };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
-        // A new inode starts with the value read here; an unreadable override
-        // is left uncached and shown as the host attributes.
-        let cache = self.cfg.cache_guest_metadata;
-        let (known_override, cached_override) = match &data {
-            Some(data) => (self.override_stat(data).unwrap_or_default(), None),
-            None if created && cache => (OverrideStat::default(), Some(OverrideStat::default())),
-            None => match read_override_stat(f.as_raw_fd()) {
-                Ok(value) => (value, cache.then_some(value)),
-                Err(_) => (OverrideStat::default(), None),
-            },
+        let existing = claim_inode(&self.inodes.read().unwrap(), &altkey);
+        // The override read for a new inode; a known inode has its own.
+        let (data, new_override) = match existing {
+            Some(data) => (data, None),
+            None => {
+                // A new inode starts with the value read here; an unreadable
+                // override is left uncached and shown as the host attributes.
+                let cache = self.cfg.cache_guest_metadata;
+                let (known_override, cached_override) = if created && cache {
+                    (OverrideStat::default(), Some(OverrideStat::default()))
+                } else {
+                    match read_override_stat(f.as_raw_fd()) {
+                        Ok(value) => (value, cache.then_some(value)),
+                        Err(_) => (OverrideStat::default(), None),
+                    }
+                };
+                let permit = match permit {
+                    Some(permit) => permit,
+                    None => self.fd_budget.acquire()?,
+                };
+                let mut inodes = self.inodes.write().unwrap();
+                // A concurrent lookup, for example of another name of this
+                // inode, may have added it meanwhile. Adding it again would
+                // move the host inode's alternate key to the new entry and
+                // drop the first entry, whose inode number the guest holds.
+                match claim_inode(&inodes, &altkey) {
+                    Some(data) => (data, None),
+                    None => {
+                        let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+                        let data = Arc::new(InodeData {
+                            inode,
+                            guest_ino: st.st_ino,
+                            file: permit.attach(f),
+                            dev: st.st_dev,
+                            mnt_id,
+                            refcount: AtomicU64::new(1),
+                            override_stat: Mutex::new(cached_override),
+                        });
+                        inodes.insert(inode, altkey, Arc::clone(&data));
+                        (data, Some(known_override))
+                    }
+                }
+            }
+        };
+        let known_override = match new_override {
+            Some(value) => value,
+            None => self.override_stat(&data).unwrap_or_default(),
         };
         let mut attr = self.guest_attr(st, known_override);
+        attr.st_ino = data.guest_ino;
+        let inode = data.inode;
 
         let mut attr_flags: u32 = 0;
 
@@ -1791,41 +1879,6 @@ impl PassthroughFs {
         {
             attr_flags |= fuse::ATTR_SUBMOUNT;
         }
-
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            attr.st_ino = data.guest_ino;
-            data.inode
-        } else {
-            let permit = match permit {
-                Some(permit) => permit,
-                None => self.fd_budget.acquire()?,
-            };
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            self.inodes.write().unwrap().insert(
-                inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                    mnt_id,
-                },
-                Arc::new(InodeData {
-                    inode,
-                    guest_ino: st.st_ino,
-                    file: permit.attach(f),
-                    dev: st.st_dev,
-                    mnt_id,
-                    refcount: AtomicU64::new(1),
-                    override_stat: Mutex::new(cached_override),
-                }),
-            );
-
-            inode
-        };
 
         debug!("do_lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
 
@@ -2158,40 +2211,35 @@ impl PassthroughFs {
     }
 }
 
+/// Takes a lookup reference on the inode `altkey` names, if this server knows
+/// it. The caller holds the map lock while the count rises: `forget_one`
+/// removes an inode whose count drops to zero under the write lock, so a
+/// reference taken outside the lock could revive an inode already removed and
+/// hand the guest an inode number this server no longer knows.
+fn claim_inode(
+    inodes: &MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
+    altkey: &InodeAltKey,
+) -> Option<Arc<InodeData>> {
+    let data = inodes.get_alt(altkey)?;
+    data.refcount.fetch_add(1, Ordering::Relaxed);
+    Some(Arc::clone(data))
+}
+
 fn forget_one(
     inodes: &mut MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>,
     inode: Inode,
     count: u64,
 ) {
     if let Some(data) = inodes.get(&inode) {
-        // Acquiring the write lock on the inode map prevents new lookups from incrementing the
-        // refcount but there is the possibility that a previous lookup already acquired a
-        // reference to the inode data and is in the process of updating the refcount so we need
-        // to loop here until we can decrement successfully.
-        loop {
-            let refcount = data.refcount.load(Ordering::Relaxed);
-
-            // Saturating sub because it doesn't make sense for a refcount to go below zero and
-            // we don't want misbehaving clients to cause integer overflow.
-            let new_count = refcount.saturating_sub(count);
-
-            // Synchronizes with the acquire load in `do_lookup`.
-            if data
-                .refcount
-                .compare_exchange(refcount, new_count, Ordering::Release, Ordering::Relaxed)
-                .unwrap()
-                == refcount
-            {
-                if new_count == 0 {
-                    // We just removed the last refcount for this inode. There's no need for an
-                    // acquire fence here because we hold a write lock on the inode map and any
-                    // thread that is waiting to do a forget on the same inode will have to wait
-                    // until we release the lock. So there's is no other release store for us to
-                    // synchronize with before deleting the entry.
-                    inodes.remove(&inode);
-                }
-                break;
-            }
+        // Lookups raise the count only under the map lock (see `claim_inode`),
+        // which the caller holds for writing, so the count cannot change here.
+        // Saturating sub because it doesn't make sense for a refcount to go
+        // below zero and we don't want misbehaving clients to cause integer
+        // overflow.
+        let new_count = data.refcount.load(Ordering::Relaxed).saturating_sub(count);
+        data.refcount.store(new_count, Ordering::Relaxed);
+        if new_count == 0 {
+            inodes.remove(&inode);
         }
     }
 }
@@ -2721,7 +2769,9 @@ impl FileSystem for PassthroughFs {
             .ok_or_else(ebadf)?;
 
         enum Data {
-            Handle(RawFd),
+            // Kept, not just its descriptor number, so that a concurrent
+            // RELEASE cannot close the descriptor while it is used here.
+            Handle(Arc<HandleData>),
             ProcPath(CString),
         }
 
@@ -2735,9 +2785,7 @@ impl FileSystem for PassthroughFs {
                 .filter(|hd| hd.inode == inode)
                 .cloned()
                 .ok_or_else(ebadf)?;
-
-            let fd = hd.file.write().unwrap().as_raw_fd();
-            Data::Handle(fd)
+            Data::Handle(hd)
         } else {
             let pathname = CString::new(format!("{}", inode_data.file.as_raw_fd()))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -2751,7 +2799,9 @@ impl FileSystem for PassthroughFs {
                 // Safe because this doesn't modify any memory and we check the return value.
                 let res = unsafe {
                     match data {
-                        Data::Handle(fd) => libc::fchmod(fd, attr.st_mode),
+                        Data::Handle(ref hd) => {
+                            libc::fchmod(hd.file.read().unwrap().as_raw_fd(), attr.st_mode)
+                        }
                         Data::ProcPath(ref p) => libc::fchmodat(
                             self.proc_self_fd.as_raw_fd(),
                             p.as_ptr(),
@@ -2801,7 +2851,9 @@ impl FileSystem for PassthroughFs {
         if valid.contains(SetattrValid::SIZE) {
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(fd) => unsafe { libc::ftruncate(fd, attr.st_size) },
+                Data::Handle(ref hd) => unsafe {
+                    libc::ftruncate(hd.file.read().unwrap().as_raw_fd(), attr.st_size)
+                },
                 _ => {
                     // There is no `ftruncateat` so we need to get a new fd and truncate it.
                     let f = self.open_inode(inode, libc::O_NONBLOCK | libc::O_RDWR)?;
@@ -2841,7 +2893,9 @@ impl FileSystem for PassthroughFs {
 
             // Safe because this doesn't modify any memory and we check the return value.
             let res = match data {
-                Data::Handle(fd) => unsafe { libc::futimens(fd, tvs.as_ptr()) },
+                Data::Handle(ref hd) => unsafe {
+                    libc::futimens(hd.file.read().unwrap().as_raw_fd(), tvs.as_ptr())
+                },
                 Data::ProcPath(ref p) => unsafe {
                     libc::utimensat(self.proc_self_fd.as_raw_fd(), p.as_ptr(), tvs.as_ptr(), 0)
                 },
@@ -3165,7 +3219,7 @@ impl FileSystem for PassthroughFs {
                     )
                 }
             }
-            FileOrLink::Link(link) => {
+            FileOrLink::Link { path: link, .. } => {
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe {
                     libc::lsetxattr(
@@ -3216,7 +3270,7 @@ impl FileSystem for PassthroughFs {
                     )
                 }
             }
-            FileOrLink::Link(link) => {
+            FileOrLink::Link { path: link, .. } => {
                 // Safe because this will only modify the contents of `buf`.
                 unsafe {
                     libc::lgetxattr(
@@ -3272,7 +3326,7 @@ impl FileSystem for PassthroughFs {
                     libc::removexattr(proc_fd_path(file.as_raw_fd())?.as_ptr(), host_name.as_ptr())
                 }
             }
-            FileOrLink::Link(link) => {
+            FileOrLink::Link { path: link, .. } => {
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe { libc::lremovexattr(link.as_ptr(), host_name.as_ptr()) }
             }
