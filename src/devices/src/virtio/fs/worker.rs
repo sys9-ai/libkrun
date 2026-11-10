@@ -6,10 +6,10 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
@@ -74,8 +74,8 @@ impl FsServer {
 /// four readers of one uncached file fetch in parallel. A guest with more
 /// vCPUs runs more processes at once, each of which may wait on a request, so
 /// a share serves up to one request per vCPU. Threads beyond the first exit
-/// once idle for `IDLE_THREAD_EXIT`, so the bound costs only while requests
-/// wait together.
+/// once the share has had no request for `IDLE_THREAD_EXIT`, so the bound
+/// costs only while the share is in use.
 ///
 /// The macOS passthrough keeps per-inode state that its operations do not
 /// synchronize with each other (the descriptor kept for an unlinked file), so
@@ -89,10 +89,13 @@ fn max_request_threads(_vcpus: u8) -> usize {
     1
 }
 
-/// How long a share's thread other than its first waits for a request before
-/// it exits. Starting a thread costs tens of microseconds, so this only needs
-/// to keep threads through the pauses within a burst of requests, such as a
-/// build or a checkout, not across bursts.
+/// How long a share must go without a request before its threads other than
+/// the first exit. A share that keeps receiving requests keeps its threads,
+/// however far apart the requests are. Starting a thread costs tens of
+/// microseconds, paid by the first request that waits together with another
+/// after the share was idle, so this only needs to keep threads through the
+/// pauses within a burst of requests, such as a build or a checkout, not
+/// across bursts.
 #[cfg(not(test))]
 const IDLE_THREAD_EXIT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -110,7 +113,8 @@ type Request<'a> = (usize, DescriptorChain<'a>);
 ///
 /// Leadership is the one `Leader` value, passed through a channel of
 /// capacity one rather than guarded by a mutex, so that a thread waiting for
-/// its turn can stop waiting when idle for `IDLE_THREAD_EXIT`.
+/// its turn can stop waiting once the share has been idle for
+/// `IDLE_THREAD_EXIT`.
 struct Pool<'a> {
     /// Hands leadership on.
     hand_on: Sender<Leader>,
@@ -127,10 +131,15 @@ struct Pool<'a> {
     /// when a request is taken while no other thread is idle, up to the
     /// worker's `max_threads`: requests sent one after another keep two
     /// threads, one serving and one leading, and only requests that wait
-    /// together start more. One sequential reader may still use two or three, as the
-    /// guest's readahead overlaps its requests. Every thread but the first
-    /// exits once idle for `IDLE_THREAD_EXIT`.
+    /// together start more. One sequential reader may still use two or
+    /// three, as the guest's readahead overlaps its requests. Every thread
+    /// but the first exits once the share has had no request for
+    /// `IDLE_THREAD_EXIT`.
     threads: AtomicUsize,
+    /// When the pool started; `last_request` counts from it.
+    started: Instant,
+    /// Nanoseconds from `started` to when the leader last popped a request.
+    last_request: AtomicU64,
     /// Requests that change an inode, kept in the order the guest sent them.
     /// An inode has an entry while a thread serves one of its changes; the
     /// changes popped meanwhile wait in the entry for that same thread.
@@ -147,22 +156,127 @@ struct Leader {
     stopping: bool,
 }
 
-impl Pool<'_> {
-    /// Ends a thread's part in serving this share, unless no other thread
-    /// would be left idle to take the next request: one that waits on slow
-    /// storage would otherwise hold up every request behind it.
+/// Leadership held by one thread. Dropping it hands it on, also when the
+/// thread panics while leading: it then hands it on stopping, so the other
+/// threads stop too and joining the worker reports the panic, instead of
+/// waiting forever for a leader that unwinding dropped.
+struct Leadership<'p> {
+    hand_on: &'p Sender<Leader>,
+    leader: Option<Leader>,
+}
+
+impl std::ops::Deref for Leadership<'_> {
+    type Target = Leader;
+
+    fn deref(&self) -> &Leader {
+        self.leader.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for Leadership<'_> {
+    fn deref_mut(&mut self) -> &mut Leader {
+        self.leader.as_mut().unwrap()
+    }
+}
+
+impl Drop for Leadership<'_> {
+    fn drop(&mut self) {
+        let mut leader = self.leader.take().unwrap();
+        if thread::panicking() {
+            leader.stopping = true;
+        }
+        // Never fails or blocks: the pool holds the receiver, and the one
+        // leader is not in the channel while held.
+        self.hand_on.send(leader).unwrap();
+    }
+}
+
+impl<'a> Pool<'a> {
+    /// A pool of one thread, the caller, idle and free to lead.
+    fn new(epoll: Epoll) -> Self {
+        let (hand_on, lead) = crossbeam_channel::bounded(1);
+        hand_on
+            .send(Leader {
+                epoll,
+                stopping: false,
+            })
+            .unwrap();
+        Pool {
+            hand_on,
+            lead,
+            idle: AtomicUsize::new(1),
+            threads: AtomicUsize::new(1),
+            started: Instant::now(),
+            last_request: AtomicU64::new(0),
+            changing: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn saw_request(&self) {
+        self.last_request
+            .store(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// How long the share has gone without a request.
+    fn idle_for(&self) -> Duration {
+        let last = Duration::from_nanos(self.last_request.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(last)
+    }
+
+    /// How long a thread that may retire waits before trying: until the share
+    /// has been idle for `IDLE_THREAD_EXIT`, or another whole period if it
+    /// already has and the thread could not retire.
+    fn until_retirement(&self) -> Duration {
+        IDLE_THREAD_EXIT
+            .checked_sub(self.idle_for())
+            .filter(|left| !left.is_zero())
+            .unwrap_or(IDLE_THREAD_EXIT)
+    }
+
+    /// Ends a thread's part in serving this share once the share has had no
+    /// request for `IDLE_THREAD_EXIT`, but only while another thread stays
+    /// idle to take the next request: one that waits on slow storage would
+    /// otherwise hold up every request behind it.
     fn retire(&self) -> bool {
+        if self.idle_for() < IDLE_THREAD_EXIT {
+            return false;
+        }
         let retired = self
             .idle
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |idle| {
                 (idle > 1).then_some(idle - 1)
             })
             .is_ok();
-        // After `idle`, so that `threads` never counts fewer threads than run.
+        // The retiring thread still runs until it returns, so `threads` may
+        // briefly count one fewer than run, and a thread started meanwhile
+        // can exceed the bound by the one that is exiting.
         if retired {
             self.threads.fetch_sub(1, Ordering::SeqCst);
         }
         retired
+    }
+
+    /// Waits for leadership. Returns None if this thread, if
+    /// `exits_when_idle`, retires instead.
+    fn wait_to_lead(&self, exits_when_idle: bool) -> Option<Leadership<'_>> {
+        let leader = if exits_when_idle {
+            loop {
+                match self.lead.recv_timeout(self.until_retirement()) {
+                    Ok(leader) => break leader,
+                    Err(RecvTimeoutError::Timeout) if self.retire() => return None,
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        unreachable!("the pool keeps both ends of its channel")
+                    }
+                }
+            }
+        } else {
+            self.lead.recv().unwrap()
+        };
+        Some(Leadership {
+            hand_on: &self.hand_on,
+            leader: Some(leader),
+        })
     }
 }
 
@@ -256,20 +370,7 @@ impl FsWorker {
                 std::process::abort();
             }
         }
-        let (hand_on, lead) = crossbeam_channel::bounded(1);
-        hand_on
-            .send(Leader {
-                epoll,
-                stopping: false,
-            })
-            .unwrap();
-        let pool = Pool {
-            hand_on,
-            lead,
-            idle: AtomicUsize::new(1),
-            threads: AtomicUsize::new(1),
-            changing: Mutex::new(HashMap::new()),
-        };
+        let pool = Pool::new(epoll);
         // This thread is the share's first and never exits while it runs: it
         // returns the worker once stopped.
         thread::scope(|scope| self.serve_requests(scope, &pool, false));
@@ -277,7 +378,8 @@ impl FsWorker {
     }
 
     /// Serves requests until the worker stops or, if `exits_when_idle`, until
-    /// this thread retires after waiting `IDLE_THREAD_EXIT` for a request.
+    /// this thread retires once the share has been idle for
+    /// `IDLE_THREAD_EXIT`.
     fn serve_requests<'scope, 'env>(
         &'env self,
         scope: &'scope thread::Scope<'scope, 'env>,
@@ -345,28 +447,9 @@ impl FsWorker {
         pool: &Pool<'a>,
         exits_when_idle: bool,
     ) -> Option<(Request<'a>, Option<u64>)> {
-        let mut leader = Self::wait_to_lead(pool, exits_when_idle)?;
-        let taken = self.take_request_as_leader(pool, &mut leader, exits_when_idle);
-        pool.hand_on.send(leader).unwrap();
-        taken
-    }
-
-    /// Waits for leadership. Returns None if this thread, if `exits_when_idle`,
-    /// retires instead.
-    fn wait_to_lead(pool: &Pool, exits_when_idle: bool) -> Option<Leader> {
-        if !exits_when_idle {
-            return Some(pool.lead.recv().unwrap());
-        }
-        loop {
-            match pool.lead.recv_timeout(IDLE_THREAD_EXIT) {
-                Ok(leader) => return Some(leader),
-                Err(RecvTimeoutError::Timeout) if pool.retire() => return None,
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    unreachable!("the pool keeps both ends of its channel")
-                }
-            }
-        }
+        let mut leadership = pool.wait_to_lead(exits_when_idle)?;
+        // Dropping the leadership hands it on.
+        self.take_request_as_leader(pool, &mut leadership, exits_when_idle)
     }
 
     fn take_request_as_leader<'a>(
@@ -394,20 +477,21 @@ impl FsWorker {
 
     /// Pops a request, waiting for the guest to add one if both queues are
     /// empty. Returns None once the worker is stopped, or once this thread, if
-    /// `exits_when_idle`, retires after waiting `IDLE_THREAD_EXIT` in vain.
+    /// `exits_when_idle`, retires because the share has been idle for
+    /// `IDLE_THREAD_EXIT`.
     fn next_request<'a>(
         &'a self,
         pool: &Pool,
         leader: &mut Leader,
         exits_when_idle: bool,
     ) -> Option<Request<'a>> {
-        let timeout = exits_when_idle.then_some(IDLE_THREAD_EXIT);
         loop {
             if leader.stopping {
                 return None;
             }
             for queue_index in [HPQ_INDEX, REQ_INDEX] {
                 if let Some(head) = self.queues[queue_index].lock().unwrap().pop(&self.mem) {
+                    pool.saw_request();
                     return Some((queue_index, head));
                 }
             }
@@ -421,6 +505,7 @@ impl FsWorker {
                     .enable_notification(&self.mem)
                     .unwrap();
             }
+            let timeout = exits_when_idle.then(|| pool.until_retirement());
             let timed_out = !arrived && self.wait(leader, timeout);
             // Notifications stay off from here until the rings are empty
             // again, including after a stop or a retirement: the next leader
@@ -442,7 +527,10 @@ impl FsWorker {
     /// if given. Returns whether it timed out.
     fn wait(&self, leader: &mut Leader, timeout: Option<Duration>) -> bool {
         let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 3];
-        let timeout_ms = timeout.map_or(-1, |timeout| timeout.as_millis() as i32);
+        // Rounded up, so the wait does not end before the share is idle long
+        // enough to retire and spin until it is.
+        let timeout_ms =
+            timeout.map_or(-1, |timeout| timeout.as_nanos().div_ceil(1_000_000) as i32);
         let count = match leader.epoll.wait(events.len(), timeout_ms, &mut events) {
             Ok(count) => count,
             Err(e) => {
@@ -950,5 +1038,73 @@ mod tests {
         worker.join().unwrap();
         drop(writer);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_share_keeps_its_threads_while_requests_keep_coming() {
+        let _one_worker = one_worker();
+        let dir = std::env::temp_dir().join(format!("krun-fs-trickle-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = std::ffi::CString::new(dir.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x40000)]).unwrap();
+        let (worker, stop, mut guest) = start(&dir, &mem);
+        guest.send(Opcode::Lookup, ROOT_ID, b"fifo\0");
+        assert!(guest.answered(2));
+        let fifo = guest.reply::<EntryOut>(1).nodeid;
+        let open = OpenIn {
+            flags: libc::O_RDONLY as u32,
+            open_flags: 0,
+        };
+        for _ in 0..THREADS {
+            guest.send(Opcode::Open, fifo, open.as_slice());
+        }
+        assert!(!guest.answered(3));
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("fifo"))
+            .unwrap();
+        assert!(guest.answered(2 + THREADS as u16));
+
+        // Requests further apart than any one thread waits, but each well
+        // within the idle period of the share, keep every thread.
+        let mut answered = 2 + THREADS as u16;
+        for _ in 0..10 {
+            thread::sleep(IDLE_THREAD_EXIT / 4);
+            guest.send(Opcode::Getattr, ROOT_ID, GetattrIn::default().as_slice());
+            answered += 1;
+            assert!(guest.answered(answered));
+        }
+        assert_eq!(request_threads(), THREADS - 1);
+
+        // They exit once the share has had no request for the idle period.
+        let deadline = Instant::now() + IDLE_THREAD_EXIT * 20;
+        while request_threads() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "idle request threads kept running"
+            );
+            thread::sleep(IDLE_THREAD_EXIT / 10);
+        }
+
+        stop.write(1).unwrap();
+        worker.join().unwrap();
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_leader_that_panics_hands_on_leadership_that_stops_the_others() {
+        let pool = Pool::new(Epoll::new().unwrap());
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _leadership = pool.wait_to_lead(false).unwrap();
+            panic!("a bug while leading");
+        }));
+
+        assert!(panicked.is_err());
+        let leader = pool.lead.try_recv().expect("leadership was dropped");
+        assert!(leader.stopping, "the other threads would keep serving");
     }
 }
