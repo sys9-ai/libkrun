@@ -1043,6 +1043,7 @@ pub fn build_microvm(
         cfg!(all(target_os = "linux", target_arch = "x86_64"))
             && (vm_resources.checkpoint_socket.is_some() || vm_resources.restore_path.is_some()),
         &vm_resources.fs,
+        vm_resources.vm_config().vcpu_count.unwrap(),
         &mut _shm_manager,
         #[cfg(not(feature = "tee"))]
         export_table,
@@ -1952,10 +1953,12 @@ fn attach_mmio_device(
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[allow(clippy::too_many_arguments)]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     _checkpoint_enabled: bool,
     fs_devs: &[FsDeviceConfig],
+    vcpus: u8,
     shm_manager: &mut ShmManager,
     #[cfg(not(feature = "tee"))] export_table: Option<ExportTable>,
     intc: IrqChip,
@@ -1974,6 +1977,7 @@ fn attach_fs_devices(
                 config.read_only,
                 config.exclusive,
                 config.writeback,
+                vcpus,
             )
             .unwrap(),
         ));

@@ -55,6 +55,7 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: passthrough::Config,
     read_only: bool,
+    vcpus: u8,
     worker_thread: Option<JoinHandle<FsWorker>>,
     paused_worker: Option<FsWorker>,
     restore_payload: Option<(Vec<u8>, std::path::PathBuf)>,
@@ -70,6 +71,9 @@ impl Fs {
         self.passthrough_cfg.checkpoint_enabled = true;
     }
 
+    /// `vcpus` is the VM's vCPU count, which bounds how many of the share's
+    /// requests are served at once.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fs_id: String,
         shared_dir: String,
@@ -78,6 +82,7 @@ impl Fs {
         read_only: bool,
         exclusive: bool,
         writeback: bool,
+        vcpus: u8,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -118,6 +123,7 @@ impl Fs {
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
+            vcpus,
             worker_thread: None,
             paused_worker: None,
             restore_payload: None,
@@ -266,6 +272,7 @@ impl VirtioDevice for Fs {
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
+            self.vcpus,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]
