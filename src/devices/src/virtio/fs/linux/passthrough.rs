@@ -191,6 +191,17 @@ mod tests {
     }
 
     #[test]
+    fn writeback_reports_mtime_when_the_guest_clock_is_slightly_ahead() {
+        let mut st = stat_with_owner(0, 0, 0o644);
+        (st.st_mtime, st.st_mtime_nsec) = (101, 100_000_000);
+        (st.st_ctime, st.st_ctime_nsec) = (100, 900_000_000);
+
+        let got = writeback_ctime(st);
+
+        assert_eq!((got.st_ctime, got.st_ctime_nsec), (101, 100_000_000));
+    }
+
+    #[test]
     fn writeback_keeps_a_ctime_beyond_the_slack_or_before_mtime() {
         let mut changed_later = stat_with_owner(0, 0, 0o644);
         (changed_later.st_mtime, changed_later.st_ctime) = (100, 161);
@@ -1210,6 +1221,14 @@ fn apply_override_stat(
 /// expiry plus flusher interval); the margin covers a slow host.
 const WRITEBACK_CTIME_SLACK: Duration = Duration::from_secs(60);
 
+/// How far a regular file's mtime may be ahead of its host ctime and still be
+/// taken as a write-back. The guest's clock stamps the mtime and the host's the
+/// ctime; a fsync lands the write-back within milliseconds, so a guest clock
+/// running slightly ahead of the host's makes the delay look negative. A guest
+/// that does not synchronize its clock starts from the host's (kvmclock), so
+/// the two stay close.
+const WRITEBACK_CTIME_GUEST_CLOCK_LEAD: Duration = Duration::from_secs(1);
+
 /// Reports a regular file's mtime as its ctime when the host ctime is only
 /// the write-back delay after it.
 ///
@@ -1222,13 +1241,16 @@ const WRITEBACK_CTIME_SLACK: Duration = Duration::from_secs(60);
 /// ctime, such as git, then treat those files as changed and read them all
 /// again. Reporting the mtime gives back
 /// exactly the ctime the guest assigned. A metadata change within the slack
-/// after a write is reported up to the slack early; a later one, or a file
-/// whose mtime was set into the past, keeps the host ctime.
+/// after a write is reported up to the slack early; a later one, a file whose
+/// mtime was set into the past, or one whose mtime is ahead of its host ctime
+/// by more than a guest clock may lead, keeps the host ctime.
 fn writeback_ctime(mut st: libc::stat64) -> libc::stat64 {
     let nanos = |sec: i64, nsec: i64| i128::from(sec) * 1_000_000_000 + i128::from(nsec);
     let delay = nanos(st.st_ctime, st.st_ctime_nsec) - nanos(st.st_mtime, st.st_mtime_nsec);
     if st.st_mode & libc::S_IFMT == libc::S_IFREG
-        && (0..=WRITEBACK_CTIME_SLACK.as_nanos() as i128).contains(&delay)
+        && (-(WRITEBACK_CTIME_GUEST_CLOCK_LEAD.as_nanos() as i128)
+            ..=WRITEBACK_CTIME_SLACK.as_nanos() as i128)
+            .contains(&delay)
     {
         st.st_ctime = st.st_mtime;
         st.st_ctime_nsec = st.st_mtime_nsec;
