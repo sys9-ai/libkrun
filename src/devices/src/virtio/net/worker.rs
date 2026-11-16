@@ -10,14 +10,80 @@ use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 use super::VNET_HDR_LEN;
 
-#[cfg(target_os = "macos")]
-use std::os::fd::RawFd;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::thread;
+use std::time::{Duration, Instant};
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+/// How long a frame may wait in one direction before the worker reports a
+/// stall. Ordinary backpressure clears within milliseconds.
+const STALL_REPORT_AFTER: Duration = Duration::from_secs(10);
+
+/// While a frame waits, the worker wakes this often to check for a stall.
+const STALL_CHECK_INTERVAL_MS: i32 = 5000;
+
+/// When the frame one direction holds back started waiting, and whether that
+/// wait was already reported as a stall. The reports go to stderr, which the
+/// embedding process keeps beside the VM, because no logger is installed for
+/// this library.
+#[derive(Default)]
+struct DeferredSince {
+    since: Option<Instant>,
+    reported: bool,
+}
+
+impl DeferredSince {
+    /// Records whether a frame is deferred now, and reports a wait that
+    /// passed `STALL_REPORT_AFTER` once, then its end. `detail` describes
+    /// the queue state that explains the wait.
+    fn observe(
+        &mut self,
+        deferred: bool,
+        direction: &str,
+        waiting_for: &str,
+        detail: impl FnOnce() -> String,
+    ) {
+        if !deferred {
+            if let Some(since) = self.since.take() {
+                if self.reported {
+                    eprintln!(
+                        "LIBKRUN VIRTIO-NET RECOVERED: {direction} frame was delivered after {} ms",
+                        since.elapsed().as_millis()
+                    );
+                }
+            }
+            self.reported = false;
+            return;
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if !self.reported && since.elapsed() >= STALL_REPORT_AFTER {
+            self.reported = true;
+            eprintln!(
+                "LIBKRUN VIRTIO-NET STALL: {direction} frame has waited {} ms for {waiting_for} ({})",
+                since.elapsed().as_millis(),
+                detail()
+            );
+        }
+    }
+}
+
+/// Describes the bytes queued in the backend socket in each direction: unread
+/// by this worker, and written by it but not yet read by the backend. A stall
+/// with a full side shows which end stopped reading. `-1` means unknown.
+fn socket_queues(fd: RawFd) -> String {
+    let mut unread: libc::c_int = -1;
+    let mut unsent: libc::c_int = -1;
+    // SAFETY: each ioctl writes one c_int through a pointer to a local.
+    unsafe {
+        libc::ioctl(fd, libc::FIONREAD, &mut unread);
+        #[cfg(target_os = "linux")]
+        libc::ioctl(fd, libc::TIOCOUTQ, &mut unsent);
+    }
+    format!("socket_unread_bytes={unread} socket_unsent_bytes={unsent}")
+}
 
 pub struct NetWorker {
     pub(super) stop: std::sync::Arc<EventFd>,
@@ -36,6 +102,9 @@ pub struct NetWorker {
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
     tx_frame_len: usize,
     tx_has_deferred_frame: bool,
+
+    rx_deferred: DeferredSince,
+    tx_deferred: DeferredSince,
 }
 
 impl NetWorker {
@@ -89,6 +158,9 @@ impl NetWorker {
             tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
+
+            rx_deferred: DeferredSince::default(),
+            tx_deferred: DeferredSince::default(),
         })
     }
 
@@ -138,7 +210,17 @@ impl NetWorker {
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
-            match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
+            // A held-back frame wakes the worker periodically, so a wait that
+            // never ends is reported instead of passing silently.
+            let timeout = if self.rx_has_deferred_frame
+                || self.tx_has_deferred_frame
+                || self.backend.has_unfinished_write()
+            {
+                STALL_CHECK_INTERVAL_MS
+            } else {
+                -1
+            };
+            match epoll.wait(epoll_events.len(), timeout, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
                         let source = event.fd();
@@ -182,6 +264,8 @@ impl NetWorker {
                         }
                     }
 
+                    self.observe_deferred_frames();
+
                     // Arm the retry timer after processing all events, so it
                     // reflects the final state of tx_has_deferred_frame.
                     #[cfg(target_os = "macos")]
@@ -203,15 +287,7 @@ impl NetWorker {
         if let Err(e) = self.rx_q.event.read() {
             log::error!("Failed to get rx event from queue: {e:?}");
         }
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by queue event)")
-        };
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
+        self.process_rx_loop();
     }
 
     pub(crate) fn process_tx_queue_event(&mut self) {
@@ -224,15 +300,67 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_readable(&mut self) {
-        if let Err(e) = self.rx_q.queue.enable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
+        self.process_rx_loop();
+    }
+
+    /// Delivers backend frames into the guest's receive buffers, then asks the
+    /// guest to notify when it adds buffers after the last one used.
+    ///
+    /// A frame left over when the buffers run out is delivered only on that
+    /// notification: the backend socket is edge-triggered and, once its buffer
+    /// is full, raises no further readable event. With `VIRTIO_RING_F_EVENT_IDX`
+    /// the guest notifies only when its index passes the `avail_event` written
+    /// by `enable_notification`, so that must be written after the pass, at the
+    /// position where it stopped; written before, it lies behind every buffer
+    /// the guest adds next and the guest never notifies. Buffers added before
+    /// re-enabling are found by its return value and consumed by another pass.
+    fn process_rx_loop(&mut self) {
+        loop {
+            if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
+                error!("error disabling queue notifications: {e:?}");
+            }
+            if let Err(e) = self.process_rx() {
+                log::error!("Failed to process rx: {e:?}");
+            }
+            match self.rx_q.queue.enable_notification(&self.mem) {
+                Ok(true) if self.rx_has_deferred_frame => continue,
+                Ok(_) => break,
+                Err(e) => {
+                    error!("error enabling queue notifications: {e:?}");
+                    break;
+                }
+            }
         }
-        if let Err(e) = self.process_rx() {
-            log::error!("Failed to process rx: {e:?} (triggered by backend socket readable)");
-        };
-        if let Err(e) = self.rx_q.queue.disable_notification(&self.mem) {
-            error!("error disabling queue notifications: {e:?}");
-        }
+    }
+
+    /// Reports a frame held back in either direction for longer than
+    /// `STALL_REPORT_AFTER`, with the queue state that tells a guest that
+    /// gives no buffers from a notification the worker missed.
+    fn observe_deferred_frames(&mut self) {
+        let (rx_queue, tx_queue, mem) = (&self.rx_q.queue, &self.tx_q.queue, &self.mem);
+        let socket = self.backend.raw_socket_fd();
+        self.rx_deferred.observe(
+            self.rx_has_deferred_frame,
+            "rx",
+            "guest receive buffers",
+            || {
+                format!(
+                    "guest_buffers_available={} {}",
+                    rx_queue.len(mem),
+                    socket_queues(socket)
+                )
+            },
+        );
+        let unfinished_write = self.backend.has_unfinished_write();
+        let tx_waiting = self.tx_has_deferred_frame || unfinished_write;
+        self.tx_deferred
+            .observe(tx_waiting, "tx", "the backend socket", || {
+                format!(
+                    "guest_frames_pending={} unfinished_write={unfinished_write} {}",
+                    tx_queue.len(mem),
+                    socket_queues(socket)
+                )
+            });
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
@@ -505,5 +633,58 @@ impl NetWorker {
             ],
             payload: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::legacy::DummyIrqChip;
+    use crate::virtio::queue::tests::VirtQueue;
+    use crate::virtio::queue::VIRTQ_DESC_F_WRITE;
+    use std::io::Write;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    // The guest offers one receive buffer, then the backend sends two frames.
+    // The second frame waits for a buffer. With VIRTIO_RING_F_EVENT_IDX the
+    // guest notifies after adding a buffer only if `avail_event` lies in the
+    // range of indices it just made available, so the worker must leave
+    // `avail_event` at the buffer the waiting frame needs next.
+    #[test]
+    fn deferred_rx_frame_asks_the_guest_to_notify_its_next_buffer() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let rx_vq = VirtQueue::new(GuestAddress(0), &mem, 4);
+        let tx_vq = VirtQueue::new(GuestAddress(0x1000), &mem, 4);
+        let mut rx_queue = rx_vq.create_queue();
+        rx_queue.set_event_idx(true);
+        let mut tx_queue = tx_vq.create_queue();
+        tx_queue.set_event_idx(true);
+
+        rx_vq.dtable[0].set(0x4000, 0x1000, VIRTQ_DESC_F_WRITE, 0);
+        rx_vq.avail.ring[0].set(0);
+        rx_vq.avail.idx.set(1);
+
+        let (worker_end, mut proxy_end) = UnixStream::pair().unwrap();
+        let mut worker = NetWorker::new(
+            DeviceQueue::new(rx_queue, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())),
+            DeviceQueue::new(tx_queue, Arc::new(EventFd::new(EFD_NONBLOCK).unwrap())),
+            InterruptTransport::new(DummyIrqChip::new().into(), "net".into()).unwrap(),
+            mem.clone(),
+            0,
+            VirtioNetBackend::UnixstreamFd(OwnedFd::from(worker_end).into_raw_fd()),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            proxy_end.write_all(&64u32.to_be_bytes()).unwrap();
+            proxy_end.write_all(&[0xab; 64]).unwrap();
+        }
+        worker.process_backend_socket_readable();
+
+        assert_eq!(rx_vq.used.idx.get(), 1);
+        assert!(worker.rx_has_deferred_frame);
+        assert_eq!(rx_vq.used.event.get(), 1);
     }
 }
