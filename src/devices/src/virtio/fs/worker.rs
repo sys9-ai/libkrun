@@ -411,7 +411,7 @@ impl FsWorker {
                 }
             }
             loop {
-                self.handle(&request.1);
+                let written = self.handle(&request.1);
                 // Then the changes of this inode popped meanwhile, in order.
                 let next = inode.and_then(|inode| {
                     let mut changing = pool.changing.lock().unwrap();
@@ -432,7 +432,7 @@ impl FsWorker {
                 if next.is_none() {
                     pool.idle.fetch_add(1, Ordering::SeqCst);
                 }
-                self.answer(request);
+                self.answer(request, written);
                 let Some(next) = next else { break };
                 request = next;
             }
@@ -563,35 +563,48 @@ impl FsWorker {
     }
 
     /// Serves the request `head` on the host, writing the reply into its
-    /// buffers. The guest sees the reply only once it is answered.
-    fn handle(&self, head: &DescriptorChain) {
+    /// buffers. The guest sees the reply only once it is answered. Returns
+    /// how many bytes the reply wrote, 0 when there is no reply.
+    fn handle(&self, head: &DescriptorChain) -> u32 {
         match (
             Reader::new(&self.mem, head.clone()),
             Writer::new(&self.mem, head.clone()),
         ) {
-            (Ok(reader), Ok(writer)) => {
-                if let Err(e) = self.server.handle_message(
-                    reader,
-                    writer,
-                    &self.shm_region,
-                    &self.exit_code,
-                    #[cfg(target_os = "macos")]
-                    &self.map_sender,
-                ) {
+            (Ok(reader), Ok(writer)) => match self.server.handle_message(
+                reader,
+                writer,
+                &self.shm_region,
+                &self.exit_code,
+                #[cfg(target_os = "macos")]
+                &self.map_sender,
+            ) {
+                // A reply fits in the request's descriptors, whose lengths
+                // are u32.
+                Ok(written) => written as u32,
+                Err(e) => {
                     error!("error handling message: {e:?}");
+                    0
                 }
-            }
+            },
             // Returned unanswered: the guest broke the descriptor format.
-            (Err(e), _) => error!("{:?}", FsError::QueueReader(e)),
-            (_, Err(e)) => error!("{:?}", FsError::QueueWriter(e)),
+            (Err(e), _) => {
+                error!("{:?}", FsError::QueueReader(e));
+                0
+            }
+            (_, Err(e)) => {
+                error!("{:?}", FsError::QueueWriter(e));
+                0
+            }
         }
     }
 
-    /// Hands a handled request back to the guest.
-    fn answer(&self, (queue_index, head): Request) {
+    /// Hands a handled request back to the guest, reporting the `written`
+    /// bytes of its reply. Linux checks that this matches the length in the
+    /// reply's header and rejects the reply otherwise.
+    fn answer(&self, (queue_index, head): Request, written: u32) {
         let needs_notification = {
             let mut queue = self.queues[queue_index].lock().unwrap();
-            if let Err(e) = queue.add_used(&self.mem, head.index, 0) {
+            if let Err(e) = queue.add_used(&self.mem, head.index, written) {
                 error!("failed to add used elements to the queue: {e:?}");
             }
             queue.needs_notification(&self.mem).unwrap()
@@ -818,6 +831,10 @@ mod tests {
         // Like the kernel, send nothing else until INIT is answered.
         guest.send(Opcode::Init, 0, init.as_slice());
         assert!(guest.answered(1));
+        // Like the kernel, require the reported length to be the reply's.
+        let reply_len: u32 = mem.read_obj(GuestAddress(BUFFERS + BUFFER_SIZE)).unwrap();
+        assert!(reply_len > 0);
+        assert_eq!(guest.queue.used.ring[0].get().len, reply_len);
         (worker, stop, guest)
     }
 
