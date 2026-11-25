@@ -119,10 +119,10 @@ impl DiskProperties {
         if let Some(device) = &self.raw_block {
             // PUNCH_HOLE on a block fd uses WRITE_ZEROES, which an NBD kernel
             // can lack even when the device supports DISCARD.
-            const BLKDISCARD: libc::c_ulong = 0x1277; // linux/fs.h: _IO(0x12, 119)
+            const BLKDISCARD: u32 = 0x1277; // linux/fs.h: _IO(0x12, 119)
             let range = [offset, len];
             // SAFETY: BLKDISCARD reads two native u64 values from range.
-            if unsafe { libc::ioctl(device.as_raw_fd(), BLKDISCARD, range.as_ptr()) } < 0 {
+            if unsafe { libc::ioctl(device.as_raw_fd(), BLKDISCARD as _, range.as_ptr()) } < 0 {
                 let err = io::Error::last_os_error();
                 // Discard is advisory on devices that cannot release storage.
                 if err.kind() != io::ErrorKind::Unsupported {
