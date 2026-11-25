@@ -75,7 +75,7 @@ struct RawBlock {
 
 #[cfg(target_os = "linux")]
 impl RawBlock {
-    fn new(file: &File) -> io::Result<Self> {
+    fn new(file: &File, open: &OpenOptions) -> io::Result<Self> {
         nix::ioctl_read_bad!(blksszget, libc::BLKSSZGET, libc::c_int);
         let mut bytes = 0;
         // SAFETY: BLKSSZGET writes one integer on a live block device.
@@ -88,7 +88,9 @@ impl RawBlock {
             ));
         }
         Ok(Self {
-            file: file.try_clone()?,
+            // Reopen the pinned inode, including its access mode. A dup shares
+            // f_wb_err: an advisory trim must not consume a guest flush error.
+            file: open.open(format!("/proc/self/fd/{}", file.as_raw_fd()))?,
             sectors_per_block: bytes / SECTOR_SIZE,
         })
     }
@@ -336,12 +338,11 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        // Use the same open description for the image and raw device ioctls.
         #[cfg(target_os = "linux")]
         let raw_block = if disk_image_format == ImageType::Raw
             && disk_image.metadata()?.file_type().is_block_device()
         {
-            Some(Arc::new(RawBlock::new(&disk_image)?))
+            Some(Arc::new(RawBlock::new(&disk_image, &open)?))
         } else {
             None
         };
@@ -671,6 +672,18 @@ mod discard_tests {
             .custom_flags(libc::O_EXCL)
             .open(&device.0)
             .unwrap();
+        // A dup shares both the file offset and writeback-error cursor. An
+        // advisory discard must observe failures independently of guest fsync.
+        use std::io::{Seek, SeekFrom};
+        let mut data_fd = File::options()
+            .read(true)
+            .write(true)
+            .open(&device.0)
+            .unwrap();
+        let mut discard_fd =
+            RawBlock::new(&data_fd, File::options().read(true).write(true)).unwrap();
+        data_fd.seek(SeekFrom::Start(4096)).unwrap();
+        assert_eq!(discard_fd.file.stream_position().unwrap(), 0);
         // Preserve the two partial ends and trim the middle block, even before
         // the guest flushes its buffered writes on the separately claimed disk.
         claim.write_all_at(&[3; 12288], 4096).unwrap();
