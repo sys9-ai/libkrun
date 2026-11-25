@@ -67,10 +67,63 @@ impl CacheType {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct RawBlock {
+    file: File,
+    sectors_per_block: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl RawBlock {
+    fn new(file: &File) -> io::Result<Self> {
+        nix::ioctl_read_bad!(blksszget, libc::BLKSSZGET, libc::c_int);
+        let mut bytes = 0;
+        // SAFETY: BLKSSZGET writes one integer on a live block device.
+        unsafe { blksszget(file.as_raw_fd(), &mut bytes) }?;
+        let bytes = u64::try_from(bytes).unwrap_or(0);
+        if bytes < SECTOR_SIZE || !bytes.is_power_of_two() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid logical block size",
+            ));
+        }
+        Ok(Self {
+            file: file.try_clone()?,
+            sectors_per_block: bytes / SECTOR_SIZE,
+        })
+    }
+
+    fn discard(&self, start: u64, end: u64) -> io::Result<()> {
+        // A hint may omit a partial logical block, but must never include bytes
+        // outside the guest's range. The caller bounded both ends by capacity.
+        let first = start.next_multiple_of(self.sectors_per_block);
+        let last = end / self.sectors_per_block * self.sectors_per_block;
+        if first >= last {
+            return Ok(());
+        }
+        let range = [first * SECTOR_SIZE, (last - first) * SECTOR_SIZE];
+        nix::ioctl_write_ptr_bad!(blkdiscard, 0x1277, [u64; 2]);
+        // SAFETY: BLKDISCARD reads the two native u64 values in range.
+        let trim = || unsafe { blkdiscard(self.file.as_raw_fd(), &range) };
+        let mut result = trim();
+        if result == Err(nix::errno::Errno::EBUSY) {
+            // BoxLite holds its exclusive claim on a separate description.
+            // Linux cannot invalidate dirty buffered writes under that claim.
+            self.file.sync_all()?;
+            result = trim();
+        }
+        match result {
+            // A pinned range or a device without discard may retain the bytes.
+            Ok(_) | Err(nix::errno::Errno::EBUSY | nix::errno::Errno::EOPNOTSUPP) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     #[cfg(target_os = "linux")]
-    raw_block: Option<Arc<File>>,
+    raw_block: Option<Arc<RawBlock>>,
     cache_type: CacheType,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
@@ -78,11 +131,11 @@ pub(crate) struct DiskProperties {
 }
 
 impl DiskProperties {
-    pub fn new(
+    fn new(
         disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
-        #[cfg(target_os = "linux")] raw_block: Option<Arc<File>>,
+        #[cfg(target_os = "linux")] raw_block: Option<Arc<RawBlock>>,
     ) -> io::Result<Self> {
         let disk_size = disk_image.lock().unwrap().size();
 
@@ -113,25 +166,14 @@ impl DiskProperties {
         if count == 0 {
             return Ok(());
         }
-        let offset = sector * SECTOR_SIZE;
-        let len = count * SECTOR_SIZE;
         #[cfg(target_os = "linux")]
-        if let Some(device) = &self.raw_block {
-            // PUNCH_HOLE on a block fd uses WRITE_ZEROES, which an NBD kernel
-            // can lack even when the device supports DISCARD.
-            const BLKDISCARD: u32 = 0x1277; // linux/fs.h: _IO(0x12, 119)
-            let range = [offset, len];
-            // SAFETY: BLKDISCARD reads two native u64 values from range.
-            if unsafe { libc::ioctl(device.as_raw_fd(), BLKDISCARD as _, range.as_ptr()) } < 0 {
-                let err = io::Error::last_os_error();
-                // Discard is advisory on devices that cannot release storage.
-                if err.kind() != io::ErrorKind::Unsupported {
-                    return Err(err);
-                }
-            }
-            return Ok(());
+        if let Some(raw) = &self.raw_block {
+            return raw.discard(sector, sector + count);
         }
-        self.file.lock().unwrap().discard_to_any(offset, len)
+        self.file
+            .lock()
+            .unwrap()
+            .discard_to_any(sector * SECTOR_SIZE, count * SECTOR_SIZE)
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -241,7 +283,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     #[cfg(target_os = "linux")]
-    raw_block: Option<Arc<File>>,
+    raw_block: Option<Arc<RawBlock>>,
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
@@ -299,7 +341,7 @@ impl Block {
         let raw_block = if disk_image_format == ImageType::Raw
             && disk_image.metadata()?.file_type().is_block_device()
         {
-            Some(Arc::new(disk_image.try_clone()?))
+            Some(Arc::new(RawBlock::new(&disk_image)?))
         } else {
             None
         };
@@ -308,6 +350,10 @@ impl Block {
         #[cfg(not(target_os = "linux"))]
         let file = ImagoFile::open_sync(file_opts)?;
         let discard_alignment = file.discard_align();
+        #[cfg(target_os = "linux")]
+        let discard_alignment = raw_block.as_ref().map_or(discard_alignment, |raw| {
+            (raw.sectors_per_block * SECTOR_SIZE) as usize
+        });
 
         let disk_image = match disk_image_format {
             ImageType::Qcow2 => {
@@ -607,7 +653,7 @@ mod discard_tests {
         file.write_all_at(&[7; 4096], 0).unwrap();
         file.write_all_at(&[9; 4096], (2 << 20) - 4096).unwrap();
         let bind = Command::new("losetup")
-            .args(["--find", "--show"])
+            .args(["--find", "--show", "--sector-size", "4096"])
             .arg(image.as_path())
             .output()
             .unwrap();
@@ -619,6 +665,32 @@ mod discard_tests {
             }
         }
         let device = Loop(String::from_utf8(bind.stdout).unwrap().trim().into());
+        let claim = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_EXCL)
+            .open(&device.0)
+            .unwrap();
+        // Preserve the two partial ends and trim the middle block, even before
+        // the guest flushes its buffered writes on the separately claimed disk.
+        claim.write_all_at(&[3; 12288], 4096).unwrap();
+        let block = Block::new(
+            "scratch".into(),
+            None,
+            CacheType::Writeback,
+            device.0.clone(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::None,
+        )
+        .unwrap();
+        block.disk.as_ref().unwrap().discard(9, 16).unwrap();
+        let mut observed = [0; 12288];
+        claim.read_exact_at(&mut observed, 4096).unwrap();
+        assert_eq!(observed[..4096], [3; 4096]);
+        assert_eq!(observed[4096..8192], [0; 4096]);
+        assert_eq!(observed[8192..], [3; 4096]);
         discard_tail(std::path::Path::new(&device.0));
         let mut data = [1; 4096];
         file.read_exact_at(&mut data, 0).unwrap();
