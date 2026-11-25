@@ -264,13 +264,7 @@ impl BlockWorker {
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
                 self.disk
-                    .file
-                    .lock()
-                    .unwrap()
-                    .discard_to_any(
-                        discard_write_data.sector * 512,
-                        discard_write_data.num_sectors as u64 * 512,
-                    )
+                    .discard(discard_write_data.sector, discard_write_data.num_sectors)
                     .map_err(RequestError::Discarding)?;
                 Ok(0)
             }

@@ -9,10 +9,12 @@ use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-#[cfg(target_os = "linux")]
-use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::{fd::AsRawFd, linux::fs::MetadataExt};
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -67,6 +69,8 @@ impl CacheType {
 
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
+    #[cfg(target_os = "linux")]
+    raw_block: Option<Arc<File>>,
     cache_type: CacheType,
     pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
@@ -78,6 +82,7 @@ impl DiskProperties {
         disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
+        #[cfg(target_os = "linux")] raw_block: Option<Arc<File>>,
     ) -> io::Result<Self> {
         let disk_size = disk_image.lock().unwrap().size();
 
@@ -91,11 +96,42 @@ impl DiskProperties {
         }
 
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            raw_block,
             cache_type,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id: disk_image_id,
             file: disk_image,
         })
+    }
+
+    pub(super) fn discard(&self, sector: u64, sectors: u32) -> io::Result<()> {
+        let count = u64::from(sectors);
+        if sector > self.nsectors || count > self.nsectors - sector {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let offset = sector * SECTOR_SIZE;
+        let len = count * SECTOR_SIZE;
+        #[cfg(target_os = "linux")]
+        if let Some(device) = &self.raw_block {
+            // PUNCH_HOLE on a block fd uses WRITE_ZEROES, which an NBD kernel
+            // can lack even when the device supports DISCARD.
+            const BLKDISCARD: libc::c_ulong = 0x1277; // linux/fs.h: _IO(0x12, 119)
+            let range = [offset, len];
+            // SAFETY: BLKDISCARD reads two native u64 values from range.
+            if unsafe { libc::ioctl(device.as_raw_fd(), BLKDISCARD, range.as_ptr()) } < 0 {
+                let err = io::Error::last_os_error();
+                // Discard is advisory on devices that cannot release storage.
+                if err.kind() != io::ErrorKind::Unsupported {
+                    return Err(err);
+                }
+            }
+            return Ok(());
+        }
+        self.file.lock().unwrap().discard_to_any(offset, len)
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -204,6 +240,8 @@ unsafe impl ByteValued for VirtioBlkConfig {}
 pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
+    #[cfg(target_os = "linux")]
+    raw_block: Option<Arc<File>>,
     cache_type: CacheType,
     disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
@@ -239,10 +277,13 @@ impl Block {
         direct_io: bool,
         sync_mode: SyncMode,
     ) -> io::Result<Block> {
-        let disk_image = OpenOptions::new()
-            .read(true)
-            .write(!is_disk_read_only)
-            .open(PathBuf::from(&disk_image_path))?;
+        let mut open = OpenOptions::new();
+        open.read(true).write(!is_disk_read_only);
+        #[cfg(target_os = "linux")]
+        if direct_io {
+            open.custom_flags(libc::O_DIRECT);
+        }
+        let disk_image = open.open(PathBuf::from(&disk_image_path))?;
 
         let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
 
@@ -253,6 +294,18 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
+        // Use the same open description for the image and raw device ioctls.
+        #[cfg(target_os = "linux")]
+        let raw_block = if disk_image_format == ImageType::Raw
+            && disk_image.metadata()?.file_type().is_block_device()
+        {
+            Some(Arc::new(disk_image.try_clone()?))
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let file = ImagoFile::from_open_file(disk_image, file_opts)?;
+        #[cfg(not(target_os = "linux"))]
         let file = ImagoFile::open_sync(file_opts)?;
         let discard_alignment = file.discard_align();
 
@@ -284,8 +337,13 @@ impl Block {
 
         let disk_image = Arc::new(Mutex::new(disk_image));
 
-        let disk_properties =
-            DiskProperties::new(disk_image.clone(), disk_image_id.clone(), cache_type)?;
+        let disk_properties = DiskProperties::new(
+            disk_image.clone(),
+            disk_image_id.clone(),
+            cache_type,
+            #[cfg(target_os = "linux")]
+            raw_block.clone(),
+        )?;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
@@ -320,6 +378,8 @@ impl Block {
             partuuid,
             config,
             disk: Some(disk_properties),
+            #[cfg(target_os = "linux")]
+            raw_block,
             cache_type,
             disk_image,
             disk_image_id,
@@ -468,6 +528,8 @@ impl VirtioDevice for Block {
                 Arc::clone(&self.disk_image),
                 self.disk_image_id.clone(),
                 self.cache_type,
+                #[cfg(target_os = "linux")]
+                self.raw_block.clone(),
             )
             .map_err(|_| ActivateError::BadActivate)?,
         };
@@ -494,5 +556,75 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod discard_tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+    use utils::tempfile::TempFile;
+
+    fn discard_tail(path: &std::path::Path) {
+        let block = Block::new(
+            "scratch".into(),
+            None,
+            CacheType::Writeback,
+            path.to_str().unwrap().into(),
+            ImageType::Raw,
+            false,
+            false,
+            SyncMode::None,
+        )
+        .unwrap();
+        let disk = block.disk.as_ref().unwrap();
+        let last = disk.nsectors() - 8;
+        assert!(disk.discard(last, 9).is_err());
+        disk.discard(last, 8).unwrap();
+    }
+
+    #[test]
+    fn raw_image_tail_discard_preserves_capacity() {
+        let image = TempFile::new().unwrap();
+        let file = image.as_file();
+        file.set_len(2 << 20).unwrap();
+        file.write_all_at(&[9; 4096], (2 << 20) - 4096).unwrap();
+        discard_tail(image.as_path());
+        assert_eq!(file.metadata().unwrap().len(), 2 << 20);
+        let mut data = [1; 4096];
+        file.read_exact_at(&mut data, (2 << 20) - 4096).unwrap();
+        assert_eq!(data, [0; 4096]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "creates a fresh loop device on a privileged Linux test host"]
+    fn raw_block_tail_discard_reaches_device() {
+        use std::process::Command;
+        let image = TempFile::new().unwrap();
+        let file = image.as_file();
+        file.set_len(2 << 20).unwrap();
+        file.write_all_at(&[7; 4096], 0).unwrap();
+        file.write_all_at(&[9; 4096], (2 << 20) - 4096).unwrap();
+        let bind = Command::new("losetup")
+            .args(["--find", "--show"])
+            .arg(image.as_path())
+            .output()
+            .unwrap();
+        assert!(bind.status.success());
+        struct Loop(String);
+        impl Drop for Loop {
+            fn drop(&mut self) {
+                let _ = Command::new("losetup").args(["-d", &self.0]).status();
+            }
+        }
+        let device = Loop(String::from_utf8(bind.stdout).unwrap().trim().into());
+        discard_tail(std::path::Path::new(&device.0));
+        let mut data = [1; 4096];
+        file.read_exact_at(&mut data, 0).unwrap();
+        assert_eq!(data, [7; 4096]);
+        file.read_exact_at(&mut data, (2 << 20) - 4096).unwrap();
+        assert_eq!(data, [0; 4096]);
+        assert_eq!(file.metadata().unwrap().len(), 2 << 20);
     }
 }
