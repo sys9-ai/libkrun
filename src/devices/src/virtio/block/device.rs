@@ -17,7 +17,7 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::{fd::AsRawFd, linux::fs::MetadataExt};
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 
 use imago::{
@@ -68,7 +68,7 @@ impl CacheType {
 }
 
 #[cfg(target_os = "linux")]
-struct RawBlock {
+pub(super) struct RawBlock {
     file: File,
     sectors_per_block: u64,
 }
@@ -127,19 +127,21 @@ pub(crate) struct DiskProperties {
     #[cfg(target_os = "linux")]
     raw_block: Option<Arc<RawBlock>>,
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    // imago serves concurrent requests: the I/O threads share the lock, and
+    // only a discard, which can invalidate data mappings, takes it exclusively.
+    pub(crate) file: Arc<RwLock<SyncFormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
 impl DiskProperties {
-    fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(super) fn new(
+        disk_image: Arc<RwLock<SyncFormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         #[cfg(target_os = "linux")] raw_block: Option<Arc<RawBlock>>,
     ) -> io::Result<Self> {
-        let disk_size = disk_image.lock().unwrap().size();
+        let disk_size = disk_image.read().unwrap().size();
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -173,7 +175,7 @@ impl DiskProperties {
             return raw.discard(sector, sector + count);
         }
         self.file
-            .lock()
+            .write()
             .unwrap()
             .discard_to_any(sector * SECTOR_SIZE, count * SECTOR_SIZE)
     }
@@ -225,11 +227,11 @@ impl Drop for DiskProperties {
         match self.cache_type {
             CacheType::Writeback => {
                 // flush() first to force any cached data out.
-                if self.file.lock().unwrap().flush().is_err() {
+                if self.file.read().unwrap().flush().is_err() {
                     error!("Failed to flush block data on drop.");
                 }
                 // Sync data out to physical media on host.
-                if self.file.lock().unwrap().sync().is_err() {
+                if self.file.read().unwrap().sync().is_err() {
                     error!("Failed to sync block data on drop.")
                 }
             }
@@ -287,7 +289,7 @@ pub struct Block {
     #[cfg(target_os = "linux")]
     raw_block: Option<Arc<RawBlock>>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<RwLock<SyncFormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<BlockWorker>>,
     paused_worker: Option<BlockWorker>,
@@ -382,7 +384,7 @@ impl Block {
             }
         };
 
-        let disk_image = Arc::new(Mutex::new(disk_image));
+        let disk_image = Arc::new(RwLock::new(disk_image));
 
         let disk_properties = DiskProperties::new(
             disk_image.clone(),
@@ -465,7 +467,7 @@ impl VirtioDevice for Block {
                     .map_err(|_| io::Error::other("block worker panicked"))?,
             );
         }
-        let disk = self.disk_image.lock().unwrap();
+        let disk = self.disk_image.read().unwrap();
         disk.flush()?;
         disk.sync()?;
         Ok(())
