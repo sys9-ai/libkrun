@@ -124,6 +124,15 @@ impl RawBlock {
 
 type Image = SyncFormatAccess<Box<dyn DynStorage>>;
 
+/// The data segments of one request, and the bytes of each. Linux honors both,
+/// so a request carries at most MAX_REQUEST_BYTES (4 MiB, above the guest's
+/// default largest request of 1280 KiB); the worker rejects a larger one
+/// before allocating its bounce buffer. A segment may be as large as the
+/// largest guest page, which older kernels raise a smaller size_max to.
+const SEG_MAX: u32 = 64;
+const SIZE_MAX: u32 = 64 << 10;
+pub(super) const MAX_REQUEST_BYTES: usize = SEG_MAX as usize * SIZE_MAX as usize;
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     #[cfg(target_os = "linux")]
@@ -411,6 +420,7 @@ impl Block {
         )?;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_BLK_F_SIZE_MAX)
             | (1u64 << VIRTIO_BLK_F_SEG_MAX)
             | (1u64 << VIRTIO_BLK_F_DISCARD)
             | (1u64 << VIRTIO_BLK_F_WRITE_ZEROES)
@@ -426,9 +436,8 @@ impl Block {
 
         let config = VirtioBlkConfig {
             capacity: disk_properties.nsectors(),
-            size_max: 0,
-            // QUEUE_SIZE - 2
-            seg_max: 254,
+            size_max: SIZE_MAX,
+            seg_max: SEG_MAX,
             max_discard_sectors: u32::MAX,
             max_discard_seg: 1,
             discard_sector_alignment: discard_alignment as u32 / 512,

@@ -1,7 +1,7 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::{DescriptorChain, DeviceQueue, Queue};
-use super::device::{CacheType, DiskProperties};
+use super::device::{CacheType, DiskProperties, MAX_REQUEST_BYTES};
 
 use crate::virtio::InterruptTransport;
 use crossbeam_channel::Sender;
@@ -187,10 +187,13 @@ impl BlockWorker {
         let queue_event = &device_queue.event;
         let virtq_ev_fd = queue_event.as_raw_fd();
         let stop_ev_fd = stop_fd.as_raw_fd();
+        // The guest cannot move the rings once the device is active, so
+        // checking them here keeps every later ring access in bounds.
+        let broken = !device_queue.queue.is_valid(mem);
         let serving = Mutex::new(Serving {
             queue: &mut device_queue.queue,
             stopping: false,
-            broken: false,
+            broken,
         });
         let kicked = Condvar::new();
         let stop = || {
@@ -318,21 +321,31 @@ fn serve(head: &DescriptorChain, mem: &GuestMemoryMmap, disk: &DiskProperties) -
         error!("invalid descriptor chain");
         return 0;
     };
+    // The status is the last writable byte, however far the data got.
+    let Some(mut status_writer) = writer
+        .available_bytes()
+        .checked_sub(1)
+        .and_then(|data_len| writer.split_at(data_len).ok())
+    else {
+        error!("virtio block request without a status byte");
+        return 0;
+    };
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         process_request(disk, &mut reader, &mut writer)
     }))
     .unwrap_or(Err(RequestError::Panicked));
     let (status, len) = match result {
-        Ok(len) => (VIRTIO_BLK_S_OK, len),
+        // A request is at most MAX_REQUEST_BYTES.
+        Ok(len) => (VIRTIO_BLK_S_OK, len as u32),
         Err(e) => {
             error!("error processing request: {e:?}");
             (VIRTIO_BLK_S_IOERR, 0)
         }
     };
-    if let Err(e) = writer.write_obj(status as u8) {
+    if let Err(e) = status_writer.write_obj(status as u8) {
         error!("Failed to write virtio block status: {e:?}")
     }
-    len as u32
+    len
 }
 
 fn process_request(
@@ -341,29 +354,27 @@ fn process_request(
     writer: &mut Writer,
 ) -> result::Result<usize, RequestError> {
     let request_header: RequestHeader = reader.read_obj().map_err(RequestError::InvalidHeader)?;
-    let offset = request_header
-        .sector
-        .checked_mul(512)
-        .ok_or(RequestError::InvalidSector);
+    // The disk offset of a read or write of len bytes, checked before the
+    // bounce buffer of len bytes is allocated.
+    let data_offset = |len: usize| {
+        if !len.is_multiple_of(512) || len > MAX_REQUEST_BYTES {
+            return Err(RequestError::InvalidDataLength);
+        }
+        disk_offset(disk, request_header.sector, len as u64)
+    };
     match request_header.request_type {
         VIRTIO_BLK_T_IN => {
-            // The last writable byte is the status.
-            let data_len = writer
-                .available_bytes()
-                .checked_sub(1)
-                .filter(|len| len.is_multiple_of(512))
-                .ok_or(RequestError::InvalidDataLength)?;
+            let data_len = writer.available_bytes();
+            let offset = data_offset(data_len)?;
             writer
-                .write_from_at(disk, data_len, offset?)
+                .write_from_at(disk, data_len, offset)
                 .map_err(RequestError::WritingToDescriptor)
         }
         VIRTIO_BLK_T_OUT => {
             let data_len = reader.available_bytes();
-            if !data_len.is_multiple_of(512) {
-                return Err(RequestError::InvalidDataLength);
-            }
+            let offset = data_offset(data_len)?;
             reader
-                .read_to_at(disk, data_len, offset?)
+                .read_to_at(disk, data_len, offset)
                 .map_err(RequestError::ReadingFromDescriptor)
         }
         VIRTIO_BLK_T_FLUSH => match disk.cache_type() {
@@ -399,11 +410,8 @@ fn process_request(
             let discard_write_data: DiscardWriteData = reader
                 .read_obj()
                 .map_err(RequestError::ReadingFromDescriptor)?;
-            let offset = discard_write_data
-                .sector
-                .checked_mul(512)
-                .ok_or(RequestError::InvalidSector)?;
             let length = u64::from(discard_write_data.num_sectors) * 512;
+            let offset = disk_offset(disk, discard_write_data.sector, length)?;
             let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
             if unmap {
                 disk.image_mut()
@@ -418,6 +426,18 @@ fn process_request(
         }
         _ => Err(RequestError::UnknownRequest),
     }
+}
+
+/// The byte offset of len bytes at sector, which must all lie within the disk.
+fn disk_offset(disk: &DiskProperties, sector: u64, len: u64) -> result::Result<u64, RequestError> {
+    sector
+        .checked_mul(512)
+        .filter(|offset| {
+            offset
+                .checked_add(len)
+                .is_some_and(|end| end <= disk.nsectors() * 512)
+        })
+        .ok_or(RequestError::InvalidSector)
 }
 
 #[cfg(test)]
@@ -441,6 +461,7 @@ mod tests {
     const READ_LATENCY: Duration = Duration::from_millis(100);
     const RING_SIZE: u16 = 128;
     const BUFFERS: u64 = 0x10000;
+    const DISK_SIZE: u64 = 64 << 20;
 
     /// How many reads of a SlowDisk run now, and the most that ran at once.
     #[derive(Debug, Default)]
@@ -465,7 +486,7 @@ mod tests {
 
     impl Storage for SlowDisk {
         fn size(&self) -> io::Result<u64> {
-            Ok(1 << 20)
+            Ok(DISK_SIZE)
         }
 
         async unsafe fn pure_readv(
@@ -513,8 +534,11 @@ mod tests {
     }
 
     impl<'a> Guest<'a> {
-        fn start(mem: &'a GuestMemoryMmap) -> Self {
+        /// Starts the worker on the queue, as adjusted by the guest.
+        fn start(mem: &'a GuestMemoryMmap, adjust: impl FnOnce(&mut Queue)) -> Self {
             let queue = VirtQueue::new(GuestAddress(0), mem, RING_SIZE);
+            let mut device_queue = queue.create_queue();
+            adjust(&mut device_queue);
             let reads = Arc::new(Reads::default());
             let slow = SlowDisk {
                 helper: CommonStorageHelper::default(),
@@ -525,7 +549,7 @@ mod tests {
             let kick = Arc::new(EventFd::new(0).unwrap());
             let stop = EventFd::new(0).unwrap();
             let worker = BlockWorker::new(
-                DeviceQueue::new(queue.create_queue(), kick.clone()),
+                DeviceQueue::new(device_queue, kick.clone()),
                 InterruptTransport::new(DummyIrqChip::new().into(), "block".into()).unwrap(),
                 mem.clone(),
                 DiskProperties::new(
@@ -612,7 +636,7 @@ mod tests {
     #[test]
     fn slow_reads_are_served_concurrently() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
-        let guest = Guest::start(&mem);
+        let guest = Guest::start(&mem, |_| {});
         for i in 0..16 {
             guest.add_read(i);
         }
@@ -632,7 +656,7 @@ mod tests {
     #[test]
     fn at_most_sixteen_requests_are_in_flight() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
-        let guest = Guest::start(&mem);
+        let guest = Guest::start(&mem, |_| {});
         for i in 0..32 {
             guest.add_read(i);
         }
@@ -648,7 +672,7 @@ mod tests {
     #[test]
     fn a_queue_claiming_more_requests_than_it_holds_is_not_served() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
-        let guest = Guest::start(&mem);
+        let guest = Guest::start(&mem, |_| {});
         guest.add_read(0);
         guest.queue.avail.idx.set(RING_SIZE + 1);
         guest.kick.write(1).unwrap();
@@ -661,9 +685,65 @@ mod tests {
     }
 
     #[test]
+    fn a_queue_with_rings_outside_guest_memory_is_not_served() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        let guest = Guest::start(&mem, |queue| queue.avail_ring = GuestAddress(0x100000));
+        guest.add_read(0);
+        guest.queue.avail.idx.set(1);
+        guest.kick.write(1).unwrap();
+        thread::sleep(READ_LATENCY);
+        assert_eq!(guest.queue.used.idx.get(), 0);
+        assert_eq!(guest.reads.most.load(Ordering::SeqCst), 0);
+        guest.stop();
+    }
+
+    #[test]
+    fn a_read_longer_than_a_request_can_be_is_refused_without_reading() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x800000)]).unwrap();
+        let guest = Guest::start(&mem, |_| {});
+        guest.add_read(0);
+        let len = MAX_REQUEST_BYTES as u32 + 512;
+        guest.queue.dtable[1].set(0x200000, len, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, 2);
+        guest.submit(1);
+        assert_eq!(guest.status(0), VIRTIO_BLK_S_IOERR);
+        assert_eq!(guest.queue.used.ring[0].get().len, 0);
+        assert_eq!(guest.reads.most.load(Ordering::SeqCst), 0);
+        guest.stop();
+    }
+
+    #[test]
+    fn a_read_past_the_end_of_the_disk_is_refused_without_reading() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
+        let guest = Guest::start(&mem, |_| {});
+        guest.add_read(0);
+        guest.add_read(1);
+        // Request 0 reads 4 KiB ending 512 bytes past the disk; request 1 the
+        // last 4 KiB of the disk.
+        let last = RequestHeader {
+            request_type: VIRTIO_BLK_T_IN,
+            _reserved: 0,
+            sector: DISK_SIZE / 512 - 7,
+        };
+        mem.write_obj(last, GuestAddress(BUFFERS)).unwrap();
+        mem.write_obj(
+            RequestHeader {
+                sector: DISK_SIZE / 512 - 8,
+                ..last
+            },
+            GuestAddress(BUFFERS + 0x3000),
+        )
+        .unwrap();
+        guest.submit(2);
+        assert_eq!(guest.status(0), VIRTIO_BLK_S_IOERR);
+        assert_eq!(guest.status(1), VIRTIO_BLK_S_OK);
+        assert_eq!(guest.reads.most.load(Ordering::SeqCst), 1);
+        guest.stop();
+    }
+
+    #[test]
     fn a_read_without_room_for_its_status_is_answered() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x100000)]).unwrap();
-        let guest = Guest::start(&mem);
+        let guest = Guest::start(&mem, |_| {});
         guest.add_read(0);
         guest.add_read(1);
         // Request 0 keeps only its header: no data buffer and no status byte.

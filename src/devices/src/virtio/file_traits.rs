@@ -418,8 +418,15 @@ volatile_impl!(File);
 
 // Requests are served on several threads, and two of them may target the
 // same guest buffer. Data passes through a bounce buffer, copied to and from
-// guest memory only with volatile copies, so that no host thread holds a Rust
-// reference into memory that another thread or the guest may write.
+// guest memory only through VolatileSlice, so that no host thread holds a Rust
+// reference into memory that another thread or the guest may write. The
+// worker bounds a request's length before calling these.
+//
+// For more than 8 bytes, VolatileSlice copies with copy_nonoverlapping rather
+// than volatile accesses, so two requests that the guest pointed at
+// overlapping buffers still race on those bytes. That is inherent to any
+// device writing guest memory concurrently, as in QEMU; only the guest's view
+// of its own buffers is affected.
 #[cfg(feature = "blk")]
 impl FileReadWriteAtVolatile for DiskProperties {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
