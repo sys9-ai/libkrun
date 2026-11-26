@@ -17,7 +17,7 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::{fd::AsRawFd, linux::fs::MetadataExt};
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::JoinHandle;
 
 use imago::{
@@ -122,26 +122,29 @@ impl RawBlock {
     }
 }
 
+type Image = SyncFormatAccess<Box<dyn DynStorage>>;
+
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     #[cfg(target_os = "linux")]
     raw_block: Option<Arc<RawBlock>>,
     cache_type: CacheType,
-    // imago serves concurrent requests: the I/O threads share the lock, and
-    // only a discard, which can invalidate data mappings, takes it exclusively.
-    pub(crate) file: Arc<RwLock<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    file: Arc<RwLock<Image>>,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
 impl DiskProperties {
     pub(super) fn new(
-        disk_image: Arc<RwLock<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<RwLock<Image>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         #[cfg(target_os = "linux")] raw_block: Option<Arc<RawBlock>>,
     ) -> io::Result<Self> {
-        let disk_size = disk_image.read().unwrap().size();
+        let disk_size = disk_image
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .size();
 
         // We only support disk size, which uses the first two words of the configuration space.
         // If the image is not a multiple of the sector size, the tail bits are not exposed.
@@ -162,6 +165,21 @@ impl DiskProperties {
         })
     }
 
+    /// The image for a request. imago serves concurrent requests, so the I/O
+    /// threads share it. A panic in one request leaves the image usable, so a
+    /// poisoned lock is not an error.
+    pub(crate) fn image(&self) -> RwLockReadGuard<'_, Image> {
+        self.file.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The image alone, for a discard. A discard can invalidate the data
+    /// mappings of concurrent requests (hence imago's `&mut self`), and must
+    /// not land inside an unaligned write's read-modify-write, which would
+    /// bring the discarded bytes back.
+    pub(crate) fn image_mut(&self) -> RwLockWriteGuard<'_, Image> {
+        self.file.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(super) fn discard(&self, sector: u64, sectors: u32) -> io::Result<()> {
         let count = u64::from(sectors);
         if sector > self.nsectors || count > self.nsectors - sector {
@@ -170,14 +188,12 @@ impl DiskProperties {
         if count == 0 {
             return Ok(());
         }
+        let mut image = self.image_mut();
         #[cfg(target_os = "linux")]
         if let Some(raw) = &self.raw_block {
             return raw.discard(sector, sector + count);
         }
-        self.file
-            .write()
-            .unwrap()
-            .discard_to_any(sector * SECTOR_SIZE, count * SECTOR_SIZE)
+        image.discard_to_any(sector * SECTOR_SIZE, count * SECTOR_SIZE)
     }
 
     pub fn nsectors(&self) -> u64 {
@@ -227,11 +243,11 @@ impl Drop for DiskProperties {
         match self.cache_type {
             CacheType::Writeback => {
                 // flush() first to force any cached data out.
-                if self.file.read().unwrap().flush().is_err() {
+                if self.image().flush().is_err() {
                     error!("Failed to flush block data on drop.");
                 }
                 // Sync data out to physical media on host.
-                if self.file.read().unwrap().sync().is_err() {
+                if self.image().sync().is_err() {
                     error!("Failed to sync block data on drop.")
                 }
             }
@@ -289,7 +305,7 @@ pub struct Block {
     #[cfg(target_os = "linux")]
     raw_block: Option<Arc<RawBlock>>,
     cache_type: CacheType,
-    disk_image: Arc<RwLock<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<RwLock<Image>>,
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<BlockWorker>>,
     paused_worker: Option<BlockWorker>,
@@ -467,7 +483,10 @@ impl VirtioDevice for Block {
                     .map_err(|_| io::Error::other("block worker panicked"))?,
             );
         }
-        let disk = self.disk_image.read().unwrap();
+        let disk = self
+            .disk_image
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         disk.flush()?;
         disk.sync()?;
         Ok(())
@@ -505,7 +524,7 @@ impl VirtioDevice for Block {
 
     fn resume(&mut self) -> io::Result<()> {
         if let Some(worker) = self.paused_worker.take() {
-            self.worker_thread = Some(worker.run());
+            self.worker_thread = Some(worker.run()?);
         }
         Ok(())
     }
@@ -590,7 +609,10 @@ impl VirtioDevice for Block {
             disk,
             self.worker_stopfd.try_clone().unwrap(),
         );
-        self.worker_thread = Some(worker.run());
+        self.worker_thread = Some(worker.run().map_err(|e| {
+            error!("Cannot start the virtio-blk worker: {e}");
+            ActivateError::BadActivate
+        })?);
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())

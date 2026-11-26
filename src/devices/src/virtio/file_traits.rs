@@ -7,7 +7,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::os::unix::io::AsRawFd;
 
 #[cfg(feature = "blk")]
-use imago::io_buffers::{IoVector, IoVectorMut};
+use imago::io_buffers::IoBuffer;
 use vm_memory::VolatileSlice;
 
 use libc::{c_int, c_void, read, readv, size_t, write, writev};
@@ -416,6 +416,10 @@ macro_rules! volatile_impl {
 
 volatile_impl!(File);
 
+// Requests are served on several threads, and two of them may target the
+// same guest buffer. Data passes through a bounce buffer, copied to and from
+// guest memory only with volatile copies, so that no host thread holds a Rust
+// reference into memory that another thread or the guest may write.
 #[cfg(feature = "blk")]
 impl FileReadWriteAtVolatile for DiskProperties {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -423,17 +427,19 @@ impl FileReadWriteAtVolatile for DiskProperties {
     }
 
     fn read_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
-        if bufs.is_empty() {
+        let image = self.image();
+        let mut bounce = IoBuffer::new(bufs.iter().map(|b| b.len()).sum(), image.mem_align())?;
+        if bounce.is_empty() {
             return Ok(0);
         }
-
-        let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
-        let full_length = iovec
-            .len()
-            .try_into()
-            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.read().unwrap().readv(iovec, offset)?;
-        Ok(full_length)
+        image.read(&mut bounce, offset)?;
+        let data = bounce.as_ref().into_slice();
+        let mut at = 0;
+        for buf in bufs {
+            buf.copy_from(&data[at..at + buf.len()]);
+            at += buf.len();
+        }
+        Ok(data.len())
     }
 
     fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
@@ -441,16 +447,18 @@ impl FileReadWriteAtVolatile for DiskProperties {
     }
 
     fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
-        if bufs.is_empty() {
+        let image = self.image();
+        let mut bounce = IoBuffer::new(bufs.iter().map(|b| b.len()).sum(), image.mem_align())?;
+        if bounce.is_empty() {
             return Ok(0);
         }
-
-        let (iovec, _guard) = IoVector::from_volatile_slice(bufs);
-        let full_length = iovec
-            .len()
-            .try_into()
-            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.read().unwrap().writev(iovec, offset)?;
-        Ok(full_length)
+        let data = bounce.as_mut().into_slice();
+        let mut at = 0;
+        for buf in bufs {
+            buf.copy_to(&mut data[at..at + buf.len()]);
+            at += buf.len();
+        }
+        image.write(&bounce, offset)?;
+        Ok(bounce.len())
     }
 }
