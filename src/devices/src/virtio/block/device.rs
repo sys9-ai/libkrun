@@ -127,10 +127,16 @@ type Image = SyncFormatAccess<Box<dyn DynStorage>>;
 /// The data segments of one request, and the bytes of each. Linux honors both,
 /// so a request carries at most MAX_REQUEST_BYTES (4 MiB, above the guest's
 /// default largest request of 1280 KiB); the worker rejects a larger one
-/// before allocating its bounce buffer. A segment may be as large as the
-/// largest guest page, which older kernels raise a smaller size_max to.
-const SEG_MAX: u32 = 64;
-const SIZE_MAX: u32 = 64 << 10;
+/// before allocating its bounce buffer.
+///
+/// Without indirect descriptors each segment takes a ring entry, so few large
+/// segments keep many requests in the 256-entry ring: a contiguous 1280 KiB
+/// read takes 7 entries, and even a request of scattered pages at most 18,
+/// leaving room for about as many requests as the worker serves at once.
+/// size_max stays at least the largest guest page (64 KiB), which older
+/// kernels raise a smaller size_max to.
+const SEG_MAX: u32 = 16;
+const SIZE_MAX: u32 = 256 << 10;
 pub(super) const MAX_REQUEST_BYTES: usize = SEG_MAX as usize * SIZE_MAX as usize;
 
 /// Helper object for setting up all `Block` fields derived from its backing file.

@@ -441,6 +441,8 @@ impl Queue {
         let avail_ring_size = 6 + 2 * queue_size;
         let used_ring = self.used_ring;
         let used_ring_size = 6 + 8 * queue_size;
+        // check_range covers every byte of each ring, so a ring that starts
+        // below guest memory or spans a hole between regions is refused.
         if !self.ready {
             error!("attempt to use virtio queue that is not marked ready");
             false
@@ -448,30 +450,21 @@ impl Queue {
         {
             error!("virtio queue with invalid size: {}", self.size);
             false
-        } else if desc_table
-            .checked_add(desc_table_size)
-            .is_none_or(|v| !mem.address_in_range(v))
-        {
+        } else if !mem.check_range(desc_table, desc_table_size as usize) {
             error!(
                 "virtio queue descriptor table goes out of bounds: start:0x{:08x} size:0x{:08x}",
                 desc_table.raw_value(),
                 desc_table_size
             );
             false
-        } else if avail_ring
-            .checked_add(avail_ring_size)
-            .is_none_or(|v| !mem.address_in_range(v))
-        {
+        } else if !mem.check_range(avail_ring, avail_ring_size as usize) {
             error!(
                 "virtio queue available ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
                 avail_ring.raw_value(),
                 avail_ring_size
             );
             false
-        } else if used_ring
-            .checked_add(used_ring_size)
-            .is_none_or(|v| !mem.address_in_range(v))
-        {
+        } else if !mem.check_range(used_ring, used_ring_size as usize) {
             error!(
                 "virtio queue used ring goes out of bounds: start:0x{:08x} size:0x{:08x}",
                 used_ring.raw_value(),
@@ -1106,6 +1099,26 @@ pub(crate) mod tests {
         q.used_ring = GuestAddress(0x1001);
         assert!(!q.is_valid(m));
         q.used_ring = vq.used_start();
+    }
+
+    #[test]
+    fn test_queue_validation_covers_whole_rings() {
+        let m = &GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 0x10000),
+            (GuestAddress(0x20000), 0x10000),
+        ])
+        .unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+        let mut q = vq.create_queue();
+
+        // A ring that starts in the hole and ends in the next region.
+        q.avail_ring = GuestAddress(0x20000 - 0x10);
+        assert!(!q.is_valid(m));
+        q.avail_ring = vq.avail_start();
+
+        // A table that ends exactly at the end of a region.
+        q.desc_table = GuestAddress(0x10000 - 16 * 16);
+        assert!(q.is_valid(m));
     }
 
     #[test]
